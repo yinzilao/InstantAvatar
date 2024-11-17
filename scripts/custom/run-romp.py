@@ -9,13 +9,14 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--image_folder", type=str, required=True)
     args = parser.parse_args()
 
     settings = romp.main.default_settings 
     romp_model = romp.ROMP(settings)
 
     results = []
-    for p in tqdm(sorted(glob.glob(f"{args.data_dir}/images/*"))):
+    for p in tqdm(sorted(glob.glob(f"{args.data_dir}/{args.image_folder}/*"))):
         img = cv2.imread(p)
         result = romp_model(img)
         if result["body_pose"].shape[0] > 1:

@@ -18,17 +18,22 @@ def convert(JSON_FOLDER, NPY_PATH):
             with open(JSON_PATH, 'r') as f:
                 data = json.load(f)
             
-            # Extract the pose data from the JSON data
-            pose_data = np.array(data['people'][0]['pose_keypoints_2d']).reshape((-1, 3))
-            
-            # Add the pose data to the list
-            pose_data_list.append(pose_data)
+            # Check if 'people' list is not empty
+            if len(data['people']) > 0:
+                # Extract the pose data from the JSON data
+                pose_data = np.array(data['people'][0]['pose_keypoints_2d']).reshape((-1, 3))
+                # Add the pose data to the list
+                pose_data_list.append(pose_data)
+            else:
+                print(f"No people detected in {JSON_FILE}. Skipping.")
 
-    # Convert the list of pose data arrays to a single NumPy array
-    pose_data_array = np.stack(pose_data_list, axis=0)
-
-    # Save the pose data as an NPY file
-    np.save(NPY_PATH, pose_data_array)
+    # Convert the list of pose data arrays to a single NumPy array if not empty
+    if pose_data_list:
+        pose_data_array = np.stack(pose_data_list, axis=0)
+        # Save the pose data as an NPY file
+        np.save(NPY_PATH, pose_data_array)
+    else:
+        print("No pose data to save.")
 
 
 if __name__ == "__main__":

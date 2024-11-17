@@ -1,3 +1,17 @@
 outputs/
 __pycache__/
 *.swp
+*.png
+*.jpg
+*.jpeg
+*.webp
+data/
+logs/
+*.pth
+*.pt
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.h5
+*.hdf5

@@ -1,5 +1,5 @@
 defaults:
-  - dataset: peoplesnapshot/male-3-casual
+  - dataset: semes/a2
   - deformer: fast_snarf
   - network: ngp
   - sampler: patch
@@ -17,8 +17,8 @@ model:
     deformer: ${deformer}
     renderer: ${renderer}
     optimize_SMPL:
-      enable: false 
-      is_refine: false
+      enable: true
+      is_refine: true
       lr: 1e-4
     loss:
       _target_: instant_avatar.utils.loss.NGPLoss

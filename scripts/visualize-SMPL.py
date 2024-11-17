@@ -78,15 +78,17 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", type=str, required=True)
+    parser.add_argument("--image_folder", type=str, required=True)
     parser.add_argument("--gender", type=str, default="male")
     parser.add_argument("--pose", type=str, default=None)
     parser.add_argument("--openpose_threshold", type=float, default=0.2)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--skeleton_only", action="store_true", help="Show only skeleton without SMPL avatar")
     args = parser.parse_args()
 
     camera = dict(np.load(f"{args.path}/cameras.npz"))
-    img_paths = sorted(glob.glob(f"{args.path}/images/*"))
+    img_paths = sorted(glob.glob(f"{args.path}/{args.image_folder}/*"))
     msk_paths = sorted(glob.glob(f"{args.path}/masks/*.npy"))
     if len(msk_paths) == 0:
         msk_paths = sorted(glob.glob(f"{args.path}/masks/*.png"))
@@ -126,7 +128,10 @@ if __name__ == "__main__":
                             betas=smpl_params["betas"],
                             trans=smpl_params["transl"],
                             rotation=aa2rot_numpy(np.array([1, 0, 0]) * np.pi))
-    viewer.scene.add(smpl_seq)
+    
+    # Only add SMPL sequence if skeleton_only is False
+    if not args.skeleton_only:
+        viewer.scene.add(smpl_seq)
 
     # viewr settings
     viewer.set_temp_camera(cam)
@@ -135,6 +140,40 @@ if __name__ == "__main__":
     viewer.shadows_enabled = False
 
     if args.headless:
-        viewer.save_video(video_dir=f"{args.path}/output.mp4", output_fps=args.fps)
+        output_filename = "output_sk_only.mp4" if args.skeleton_only else "output.mp4"
+        viewer.save_video(video_dir=f"{args.path}/{output_filename}", output_fps=args.fps)
     else:
         viewer.run()
+
+    # Add debug prints for SMPL parameters
+    print("SMPL Parameters:")
+    print(f"Body pose shape: {smpl_params['body_pose'].shape}")
+    print(f"Global orient shape: {smpl_params['global_orient'].shape}")
+    print(f"Betas shape: {smpl_params['betas'].shape}")
+    print(f"Translation shape: {smpl_params['transl'].shape}")
+    
+    # Debug SMPL sequence creation
+    print("\nSMPL Sequence:")
+    print(f"Gender: {args.gender}")
+    print(f"Device: {C.device}")
+    
+    # Before creating SMPLSequence
+    smpl_seq = SMPLSequence(poses_body=smpl_params["body_pose"],
+                            smpl_layer=smpl_layer,
+                            poses_root=smpl_params["global_orient"],
+                            betas=smpl_params["betas"],
+                            trans=smpl_params["transl"],
+                            rotation=aa2rot_numpy(np.array([1, 0, 0]) * np.pi))
+    
+    # Add debug prints for the sequence
+    print(f"\nSMPL Sequence created:")
+    print(f"Vertices available: {hasattr(smpl_seq, 'vertices')}")
+    print(f"Faces available: {hasattr(smpl_seq, 'faces')}")
+    
+    # Before adding to scene
+    print("\nAdding to scene...")
+    viewer.scene.add(smpl_seq)
+    
+    # Add visibility check
+    print(f"SMPL sequence visible: {smpl_seq.enabled}")
+    print(f"SMPL sequence mesh visible: {getattr(smpl_seq, 'mesh_visible', None)}")

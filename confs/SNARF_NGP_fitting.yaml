@@ -1,5 +1,5 @@
 defaults:
-  - dataset: peoplesnapshot/male-3-casual
+  - dataset: semes/a2
   - deformer: fast_snarf_debug
   - network: ngp
   - renderer: raymarcher_acc
@@ -18,7 +18,7 @@ model:
     renderer: ${renderer}
     optimize_SMPL:
       enable: true
-      is_refine: false
+      is_refine: true
       lr: 1e-4
     loss:
       _target_: instant_avatar.utils.loss.NGPLoss

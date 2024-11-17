@@ -1,5 +1,5 @@
 _target_: instant_avatar.deformers.snarf_deformer.SNARFDeformer
-model_path: ./data/SMPLX/smpl
+model_path: /app/data/SMPLX/smpl
 gender: ${dataset.gender}
 opt:
     softmax_mode: hierarchical

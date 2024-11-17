@@ -26,8 +26,13 @@ def marching_cubes(func,
     val = val.reshape(resolution, resolution, resolution)
     val = val.cpu().numpy()
 
+    # Debug the density field values
+    print(f"Value shape before marching cubes: {val.shape}")
+    print(f"Value range: [{val.min():.3f}, {val.max():.3f}]")
+    
     verts, faces, _, _ = measure.marching_cubes(
         val, level_set, gradient_direction=gradient_direction)
+    print(f"Vertices after marching cubes: {verts.shape}")
 
     bbox = bbox.cpu().numpy()
     verts = verts / resolution * (bbox[1] - bbox[0]) + bbox[0]

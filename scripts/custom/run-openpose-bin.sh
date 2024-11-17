@@ -12,7 +12,7 @@ if [ ! -d "$1" ]; then
 fi
 
 # Set the path to your OpenPose installation
-OPENPOSE_PATH="$HOME/third_party/openpose-cpp/"
+OPENPOSE_PATH="third_parties/openpose"
 
 # Set the path to the absoulte folder containing the images
 IMAGE_FOLDER=$1
