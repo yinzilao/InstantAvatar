@@ -41,6 +41,7 @@ class MaskGenerator:
         best_head_mask = None
         head_points = None
         head_bbox = None
+        debug_data = {}
         largest_area = 0
         
         for box in human_boxes:
@@ -68,10 +69,11 @@ class MaskGenerator:
                 )
                 
                 if head_result is not None:
-                    best_head_mask, head_points, head_bbox = head_result
+                    best_head_mask, head_points, head_bbox, frame_debug = head_result
+                    debug_data.update(frame_debug)
         
         self.frame_idx += 1
-        return best_mask, best_head_mask, head_points, head_bbox
+        return best_mask, best_head_mask, head_points, head_bbox, debug_data
     
     def get_person_mask(self, box_pts, box):
         """Generate full person mask using SAM"""
@@ -178,13 +180,16 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
         keypoint_conf = estimator.get_confidence() if keypoint_bbox is not None else 0.0
         print(f"Keypoint detection - Confidence: {keypoint_conf:.3f}")
         
-        # 2. Get face detection bbox
-        face_bbox, face_conf = face_detector.get_head_bbox(
-            masked_image, 
-            keypoint_bbox if keypoint_conf > 0.3 else None
-        )
-        print(f"Face detection - Confidence: {face_conf:.3f}")
-        
+        # 2. Get face detection bbox with proper error handling
+        try:
+            face_bbox, face_conf, face_debug = face_detector.get_head_bbox(
+                masked_image, 
+                keypoint_bbox if keypoint_conf > 0.3 else None
+            )
+        except ValueError:
+            print("Face detection returned invalid format")
+            face_bbox, face_conf, face_debug = None, 0.0, {'error': 'Invalid return format'}
+            
         # 3. Get previous detection from tracker
         prev_bbox, prev_conf = head_tracker.get_last_detection()
         if prev_bbox is not None:
@@ -193,7 +198,7 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
             print("No previous detection found")
         
         # 4. Combine detections with confidence weighting
-        final_bbox, confidence = combine_detections(
+        final_bbox, confidence, combiner_debug = combine_detections(
             keypoint_bbox, keypoint_conf,
             face_bbox, face_conf,
             prev_bbox, prev_conf
@@ -207,7 +212,7 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
         print(f"Validated detection - Confidence: {confidence:.3f}")
         if final_bbox is None:
             print("No valid head detection")
-            return None, None, None
+            return None, None, None, {'error': 'No valid head detection'}
             
         # 6. Get initial face mask from SAM
         masks, scores, _ = predictor.predict(
@@ -219,14 +224,18 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
         
         if masks is None or len(masks) == 0:
             print("SAM prediction failed")
-            return None, None, None
+            return None, None, None, {'error': 'SAM prediction failed'}
             
         face_mask = masks[np.argmax(scores)]
         
         # 7. Get hair mask with validation
-        hair_mask = hair_segmenter.get_validated_hair_mask(
+        hair_result = hair_segmenter.get_validated_hair_mask(
             masked_image, face_mask, final_bbox, confidence
         )
+        hair_mask = None
+        hair_debug = {}
+        if hair_result is not None:
+            hair_mask, hair_debug = hair_result
         
         # 8. Combine face and hair masks
         head_mask = face_mask.copy()
@@ -237,20 +246,38 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
         head_tracker.update(final_bbox, head_mask, confidence)
         
         # 10. Get smoothed prediction
-        smooth_bbox, smooth_mask, smooth_conf = head_tracker.get_smooth_prediction()
+        smooth_bbox, smooth_mask, smooth_conf, tracker_debug = head_tracker.get_smooth_prediction()
+        
+        # Collect all debug data
+        debug_data = {
+            'face_detector': face_debug,
+            'detection_combiner': combiner_debug,
+            'hair_segmentation': hair_debug,
+            'temporal_tracker': tracker_debug,
+            'sam_predictions': {
+                'masks': masks,
+                'scores': scores,
+                'selected_mask': face_mask
+            },
+            'final_results': {
+                'mask': smooth_mask if smooth_mask is not None else head_mask,
+                'bbox': smooth_bbox if smooth_bbox is not None else final_bbox,
+                'confidence': smooth_conf if smooth_conf is not None else confidence
+            }
+        }
         
         if smooth_mask is not None:
             print(f"Using smoothed prediction (conf: {smooth_conf:.3f})")
-            return smooth_mask, (head_points, original_indices), smooth_bbox
+            return smooth_mask, (head_points, original_indices), smooth_bbox, debug_data
             
         print(f"Using current prediction (conf: {confidence:.3f})")
-        return head_mask, (head_points, original_indices), final_bbox
+        return head_mask, (head_points, original_indices), final_bbox, debug_data
         
     except Exception as e:
         print(f"Error in create_head_mask: {e}")
         import traceback
         traceback.print_exc()
-        return None, None, None
+        return None, None, None, {'error': str(e)}  # Return empty debug dict on error
 
 def combine_face_hair_masks(face_mask, hair_mask):
     """Combine face and hair masks with validation"""
@@ -264,33 +291,6 @@ def combine_face_hair_masks(face_mask, hair_mask):
     head_mask = face_mask | hair_mask
     
     return head_mask
-
-def get_sam_mask(predictor, head_points, bbox):
-    """Get face mask using SAM"""
-    try:
-        # Add background points
-        background_points = generate_background_points(bbox)
-        
-        masks, scores, _ = predictor.predict(
-            point_coords=np.vstack([head_points, background_points]),
-            point_labels=np.concatenate([
-                np.ones(len(head_points)),
-                np.zeros(len(background_points))
-            ]),
-            box=bbox.reshape(2, 2),
-            multimask_output=True
-        )
-        
-        # Validate and select best mask
-        valid_masks, valid_scores = validate_masks(masks, scores, bbox)
-        if not valid_masks:
-            return None
-            
-        return valid_masks[np.argmax(valid_scores)]
-        
-    except Exception as e:
-        print(f"Error in get_sam_mask: {e}")
-        return None
 
 def validate_head_masks(masks, scores, box):
     """Validate masks based on size and position constraints"""
@@ -422,6 +422,139 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+def save_debug_images(img, video_name, frame_idx, **debug_data):
+    """Save debug images and visualizations"""
+    debug_root = os.path.join(video_name, "debug_images") 
+    frame_debug_dir = os.path.join(debug_root, f"frame_{frame_idx:05d}")
+    
+    # Create debug directories
+    subdirs = [
+        "detection_combiner",
+        "face_detector",
+        "temporal_tracker",
+        "hair_segmentation",
+        "sam_predictions",
+        "final_results"
+    ]
+    
+    for subdir in subdirs:
+        os.makedirs(os.path.join(frame_debug_dir, subdir), exist_ok=True)
+
+    # Save original image
+    cv2.imwrite(os.path.join(frame_debug_dir, "00_original.png"), img)
+
+    # Save detection combiner debug
+    if 'detection_combiner' in debug_data:
+        det_debug = debug_data['detection_combiner']
+        det_dir = os.path.join(frame_debug_dir, "detection_combiner")
+        
+        # Save all bboxes and their crops
+        for name, det in det_debug.items():
+            if det['bbox'] is not None:
+                bbox = det['bbox']
+                # Draw bbox on image
+                vis = img.copy()
+                cv2.rectangle(vis, 
+                            (int(bbox[0]), int(bbox[1])), 
+                            (int(bbox[2]), int(bbox[3])), 
+                            (0, 255, 0), 2)
+                cv2.putText(vis, f"{name}: {det['conf']:.2f}", 
+                           (int(bbox[0]), int(bbox[1]-5)),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.imwrite(os.path.join(det_dir, f"{name}_bbox.png"), vis)
+                
+                # Ensure valid crop coordinates
+                h, w = img.shape[:2]
+                y1 = max(0, min(h-1, int(bbox[1])))
+                y2 = max(0, min(h, int(bbox[3])))
+                x1 = max(0, min(w-1, int(bbox[0])))
+                x2 = max(0, min(w, int(bbox[2])))
+                
+                # Only save crop if dimensions are valid
+                if y2 > y1 and x2 > x1:
+                    crop = img[y1:y2, x1:x2]
+                    if crop.size > 0:  # Additional check that crop is not empty
+                        cv2.imwrite(os.path.join(det_dir, f"{name}_crop.png"), crop)
+
+    # Save face detector debug
+    if 'face_detector' in debug_data:
+        face_debug = debug_data['face_detector']
+        face_dir = os.path.join(frame_debug_dir, "face_detector")
+        
+        # Save face detections visualization
+        if face_debug['detections']:
+            face_vis = img.copy()
+            for det in face_debug['detections']:
+                bbox = det.location_data.relative_bounding_box
+                h, w = img.shape[:2]
+                x1 = int(bbox.xmin * w)
+                y1 = int(bbox.ymin * h)
+                x2 = int((bbox.xmin + bbox.width) * w)
+                y2 = int((bbox.ymin + bbox.height) * h)
+                
+                cv2.rectangle(face_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(face_vis, f"conf: {det.score[0]:.2f}", 
+                           (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                
+                # Save face crop
+                face_crop = img[y1:y2, x1:x2]
+                cv2.imwrite(os.path.join(face_dir, f"face_crop_{x1}_{y1}.png"), face_crop)
+                
+            cv2.imwrite(os.path.join(face_dir, "face_detections.png"), face_vis)
+
+    # Save temporal tracker debug
+    if 'temporal_tracker' in debug_data:
+        track_debug = debug_data['temporal_tracker']
+        track_dir = os.path.join(frame_debug_dir, "temporal_tracker")
+        
+        # Save tracking history visualization
+        if track_debug['history']:
+            track_vis = img.copy()
+            colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255)]
+            
+            for i, det in enumerate(track_debug['history'][-3:]):
+                bbox = det['bbox']
+                mask = det['mask']
+                color = colors[i % len(colors)]
+                
+                # Draw mask and bbox
+                track_vis[mask] = track_vis[mask] * 0.5 + np.array(color) * 0.5
+                cv2.rectangle(track_vis, 
+                            (int(bbox[0]), int(bbox[1])), 
+                            (int(bbox[2]), int(bbox[3])), 
+                            color, 2)
+                
+            cv2.imwrite(os.path.join(track_dir, "tracking_history.png"), track_vis)
+
+    # Save hair segmentation debug
+    if 'hair_segmentation' in debug_data:
+        hair_debug = debug_data['hair_segmentation']
+        hair_dir = os.path.join(frame_debug_dir, "hair_segmentation")
+        
+        # Save intermediate results
+        for name, mask in hair_debug.items():
+            if isinstance(mask, np.ndarray):
+                # Save binary mask
+                cv2.imwrite(os.path.join(hair_dir, f"{name}_mask.png"), 
+                           mask.astype(np.uint8) * 255)
+                # Save masked image
+                masked = img.copy()
+                masked[~mask] = 0
+                cv2.imwrite(os.path.join(hair_dir, f"{name}_masked.png"), masked)
+
+    # Save final results
+    if 'final_results' in debug_data:
+        final_dir = os.path.join(frame_debug_dir, "final_results")
+        final = debug_data['final_results']
+        
+        if 'mask' in final:
+            cv2.imwrite(os.path.join(final_dir, "final_mask.png"), 
+                       final['mask'].astype(np.uint8) * 255)
+            
+            final_vis = img.copy()
+            final_vis[~final['mask']] = 0
+            cv2.imwrite(os.path.join(final_dir, "final_masked.png"), final_vis)
+
 def main():
     # Parse arguments
     args = parse_args()
@@ -480,13 +613,27 @@ def main():
             continue
         
         # Generate masks
-        best_mask, best_head_mask, head_points, head_bbox = mask_generator.process_single_frame(
+        best_mask, best_head_mask, head_points, head_bbox, debug_data = mask_generator.process_single_frame(
             img, pts, human_boxes
         )
         
         # Save results
         save_masks_and_visualizations(
             img, fn, args.data_dir, best_mask, best_head_mask, head_points, head_bbox
+        )
+        
+        # Add human detection debug data
+        debug_data['human_detection'] = {
+            'boxes': human_boxes,
+            'selected_box': human_boxes[0] if len(human_boxes) > 0 else None
+        }
+        
+        # Save debug images
+        save_debug_images(
+            img=img,
+            video_name=args.data_dir,
+            frame_idx=idx,
+            **debug_data
         )
     
     print("Processing complete!")
