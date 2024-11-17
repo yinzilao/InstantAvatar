@@ -181,6 +181,10 @@ bash scripts/custom/process-sequence-video.sh data/custom/e1/ e1.MP4 female --fo
 
 #===============================================================
 
+pip install ultralytics
+pip install mediapipe
+pip install git+???
+#===============================================================
 bash ./bash/run-semes-demo.sh 
 
 python extract_mesh.py --config-name demo \
@@ -191,9 +195,7 @@ python extract_mesh.py --config-name demo \
 
 python export_smpl_mesh.py --config-name SNARF_NGP_fitting dataset="semes/a2" experiment="baseline" deformer=smpl
 
-pip install ultralytics
-pip install mediapipe
-pip install git+
+
 
 VIDEO_FOLDER=data/custom/e1
 GENDER=female
