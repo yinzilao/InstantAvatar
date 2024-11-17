@@ -16,3 +16,6 @@ logs/
 *.h5
 *.hdf5
 models/
+*.egg-info/
+__pycache__/
+*.DS_Store
