@@ -239,18 +239,18 @@ class HeadPointEstimator:
                 'right': 0.5
             }
             
-            # Adjust padding based on orientation
+            # Adjust padding based on orientation - Increase back-of-head padding
             if orientation['facing'] == 'left':
-                base_padding['left'] *= 0.3   # Less padding on visible side
-                base_padding['right'] *= 1.5   # More padding for back of head
+                base_padding['left'] *= 0.3    # Less padding on visible side
+                base_padding['right'] *= 2.0   # More padding for back of head (increased from 1.5)
             elif orientation['facing'] == 'right':
                 base_padding['right'] *= 0.3
-                base_padding['left'] *= 1.5
+                base_padding['left'] *= 2.0    # More padding for back of head (increased from 1.5)
                 
-            # Scale padding by orientation confidence
-            confidence_scale = 0.5 + (orientation['confidence'] * 0.5)
-            for key in base_padding:
-                base_padding[key] *= confidence_scale
+            # # Scale padding by orientation confidence
+            # confidence_scale = 0.5 + (orientation['confidence'] * 0.5)
+            # for key in base_padding:
+            #     base_padding[key] *= confidence_scale
                 
             return base_padding
         
@@ -274,9 +274,33 @@ class HeadPointEstimator:
                 relevant_points.append(point)
                 print(f"Added {keypoint_name} point: {point}")
         
+        # Get neck point info for return value
+        neck_point = None
+        is_detected = False
+        if KEYPOINT_INDICES['neck'] < len(self.keypoints):
+            neck_conf = self.keypoints[KEYPOINT_INDICES['neck'], 2]
+            if neck_conf > 0.5:
+                neck_point = self.keypoints[KEYPOINT_INDICES['neck'], :2]
+                is_detected = True
+        
+        # If no neck point detected, estimate from shoulders
+        if neck_point is None:
+            left_shoulder_idx = KEYPOINT_INDICES['left_shoulder']
+            right_shoulder_idx = KEYPOINT_INDICES['right_shoulder']
+            if (left_shoulder_idx < len(self.keypoints) and 
+                right_shoulder_idx < len(self.keypoints)):
+                left_conf = self.keypoints[left_shoulder_idx, 2]
+                right_conf = self.keypoints[right_shoulder_idx, 2]
+                if left_conf > 0.5 and right_conf > 0.5:
+                    left_shoulder = self.keypoints[left_shoulder_idx, :2]
+                    right_shoulder = self.keypoints[right_shoulder_idx, :2]
+                    neck_point = (left_shoulder + right_shoulder) / 2
+                    is_detected = False
+                    print(f"Estimated neck point: {neck_point}")
+        
         if len(relevant_points) < 2:
             print("  ✗ Not enough points for bbox estimation")
-            return None
+            return None, (None, False)
         
         # Calculate base bbox
         points = np.array(relevant_points)
@@ -301,7 +325,8 @@ class HeadPointEstimator:
         print(f"  ✓ Generated head bbox with adaptive padding: {bbox}")
         print(f"  ✓ Padding ratios: {padding}")
         
-        return bbox
+        # Return all values in expected order
+        return bbox, (neck_point, is_detected)
 
     def get_confidence(self):
         """Calculate overall confidence of head detection"""

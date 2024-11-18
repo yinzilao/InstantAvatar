@@ -41,6 +41,7 @@ class MaskGenerator:
         best_head_mask = None
         head_points = None
         head_bbox = None
+        neck_info = None
         debug_data = {}
         largest_area = 0
         
@@ -67,13 +68,13 @@ class MaskGenerator:
                     hair_segmenter=self.hair_segmenter,
                     head_tracker=self.head_tracker
                 )
-                
+                print(f"\nHead result: {head_result}")
                 if head_result is not None:
-                    best_head_mask, head_points, head_bbox, frame_debug = head_result
+                    best_head_mask, head_points, head_bbox, neck_info, frame_debug = head_result
                     debug_data.update(frame_debug)
         
         self.frame_idx += 1
-        return best_mask, best_head_mask, head_points, head_bbox, debug_data
+        return best_mask, best_head_mask, head_points, head_bbox, neck_info, debug_data
     
     def get_person_mask(self, box_pts, box):
         """Generate full person mask using SAM"""
@@ -176,15 +177,15 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
         # 1. Get keypoint-based head bbox
         estimator = HeadPointEstimator(keypoints, box)
         head_points, original_indices, background_points = estimator.get_head_points()
-        keypoint_bbox = estimator.get_head_bbox()
-        keypoint_conf = estimator.get_confidence() if keypoint_bbox is not None else 0.0
+        final_bbox, neck_info = estimator.get_head_bbox()
+        keypoint_conf = estimator.get_confidence() if final_bbox is not None else 0.0
         print(f"Keypoint detection - Confidence: {keypoint_conf:.3f}")
         
         # 2. Get face detection bbox with proper error handling
         try:
             face_bbox, face_conf, face_debug = face_detector.get_head_bbox(
                 masked_image, 
-                keypoint_bbox if keypoint_conf > 0.3 else None
+                final_bbox if keypoint_conf > 0.3 else None
             )
         except ValueError:
             print("Face detection returned invalid format")
@@ -199,7 +200,7 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
         
         # 4. Combine detections with confidence weighting
         final_bbox, confidence, combiner_debug = combine_detections(
-            keypoint_bbox, keypoint_conf,
+            final_bbox, keypoint_conf,
             face_bbox, face_conf,
             prev_bbox, prev_conf
         )
@@ -212,7 +213,7 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
         print(f"Validated detection - Confidence: {confidence:.3f}")
         if final_bbox is None:
             print("No valid head detection")
-            return None, None, None, {'error': 'No valid head detection'}
+            return None, None, None, None, {'error': 'No valid head detection'}
             
         # 6. Get initial face mask from SAM
         masks, scores, _ = predictor.predict(
@@ -224,7 +225,7 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
         
         if masks is None or len(masks) == 0:
             print("SAM prediction failed")
-            return None, None, None, {'error': 'SAM prediction failed'}
+            return None, None, None, None, {'error': 'SAM prediction failed'}
             
         face_mask = masks[np.argmax(scores)]
         
@@ -268,16 +269,16 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
         
         if smooth_mask is not None:
             print(f"Using smoothed prediction (conf: {smooth_conf:.3f})")
-            return smooth_mask, (head_points, original_indices), smooth_bbox, debug_data
+            return smooth_mask, (head_points, original_indices), smooth_bbox, neck_info, debug_data
             
         print(f"Using current prediction (conf: {confidence:.3f})")
-        return head_mask, (head_points, original_indices), final_bbox, debug_data
+        return head_mask, (head_points, original_indices), final_bbox, neck_info, debug_data
         
     except Exception as e:
         print(f"Error in create_head_mask: {e}")
         import traceback
         traceback.print_exc()
-        return None, None, None, {'error': str(e)}  # Return empty debug dict on error
+        return None, None, None, None, {'error': str(e)}
 
 def combine_face_hair_masks(face_mask, hair_mask):
     """Combine face and hair masks with validation"""
@@ -342,7 +343,7 @@ def validate_head_masks(masks, scores, box):
             
     return valid_masks, valid_scores
 
-def save_masks_and_visualizations(img, fn, output_root, best_mask, best_head_mask=None, head_points=None, head_bbox=None):
+def save_masks_and_visualizations(img, fn, output_root, best_mask, best_head_mask=None, head_points=None, head_bbox=None, neck_info=None, full_keypoints=None):  # Add full_keypoints parameter
     """Save all masks and visualizations"""
     if best_mask is None:
         return
@@ -370,9 +371,16 @@ def save_masks_and_visualizations(img, fn, output_root, best_mask, best_head_mas
     cv2.imwrite(os.path.join(output_root, "masks_body_only_images", os.path.basename(fn)), 
                 body_vis)
     
+    print(f"\nNeck info: {neck_info}")
     # Debug visualization for head mask only
     if best_head_mask is not None:
-        debug_vis = create_debug_visualization(img, best_head_mask, head_points)
+        debug_vis = create_debug_visualization(
+            img, 
+            best_head_mask, 
+            head_points,
+            neck_info,
+            full_keypoints  # Pass full keypoints to visualization
+        )
         cv2.imwrite(os.path.join(output_root, "debug_head_masks", os.path.basename(fn)), 
                    debug_vis)
     
@@ -390,9 +398,32 @@ def save_masks_and_visualizations(img, fn, output_root, best_mask, best_head_mas
         os.makedirs(os.path.dirname(head_bbox_path), exist_ok=True)
         cv2.imwrite(head_bbox_path, head_bbox_crop)
 
-def create_debug_visualization(img, head_mask=None, head_points_data=None):
-    """Create debug visualization with head mask and points"""
+def create_debug_visualization(img, head_mask=None, head_points_data=None, neck_info=None, full_keypoints=None):
+    """Create debug visualization with head mask, points, and neck point"""
     debug_vis = img.copy()
+    
+    # Draw all body keypoints if available
+    if full_keypoints is not None:
+        print("\nDrawing full body keypoints:")
+        for name, idx in KEYPOINT_INDICES.items():
+            if idx < len(full_keypoints):
+                point = full_keypoints[idx]
+                if point[2] > 0.5:  # Check confidence threshold
+                    # Draw point
+                    cv2.circle(debug_vis,
+                             (int(point[0]), int(point[1])),
+                             4, (0, 255, 0), -1)  # Green circle for body keypoints
+                    
+                    # Add label with keypoint name
+                    label_pos = (int(point[0]), int(point[1] - 10))
+                    cv2.putText(debug_vis,
+                              name,
+                              label_pos,
+                              cv2.FONT_HERSHEY_SIMPLEX,
+                              0.4,  # Smaller font size for readability
+                              (0, 255, 0),  # Green text
+                              1)
+                    print(f"Drew {name} at ({point[0]:.1f}, {point[1]:.1f}) conf: {point[2]:.2f}")
     
     # Draw head points if available
     if head_points_data is not None:
@@ -403,6 +434,22 @@ def create_debug_visualization(img, head_mask=None, head_points_data=None):
             cv2.circle(debug_vis, 
                       (int(point[0]), int(point[1])), 
                       3, color, -1)
+    
+    # Draw neck point if available
+    print(f"\nNeck info: {neck_info}")
+    if neck_info is not None:
+        neck_point, is_detected = neck_info
+        print(f"Neck point: {neck_point}, Detected: {is_detected}")
+        # Green for detected neck, yellow for estimated neck
+        color = (0, 255, 0) if is_detected else (0, 255, 255)
+        cv2.circle(debug_vis,
+                  (int(neck_point[0]), int(neck_point[1])),
+                  5, color, -1)  # Larger circle for neck point
+        label = "Detected Neck" if is_detected else "Estimated Neck"
+        cv2.putText(debug_vis,
+                   label,
+                   (int(neck_point[0]), int(neck_point[1] - 10)),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     
     # Overlay head mask in blue
     if head_mask is not None:
@@ -599,27 +646,36 @@ def main():
     # Process each frame
     print(f"Processing {len(img_lists)} frames...")
     for idx, (fn, pts) in enumerate(zip(img_lists, keypoints)):
-        print(f"Processing frame {idx+1}/{len(img_lists)}: {os.path.basename(fn)}")
+        print(f"\nProcessing frame {idx+1}/{len(img_lists)}: {os.path.basename(fn)}")
         
+        # Load image
         img = cv2.imread(fn)
         if img is None:
-            print(f"Error reading image: {fn}")
+            print(f"Failed to load image: {fn}")
             continue
             
-        # Detect humans
+        # Get keypoints and boxes for this frame
         human_boxes = get_human_boxes(img)
         if human_boxes is None:
             print(f"No humans detected in {fn}")
             continue
         
         # Generate masks
-        best_mask, best_head_mask, head_points, head_bbox, debug_data = mask_generator.process_single_frame(
+        best_mask, best_head_mask, head_points, head_bbox, neck_info, debug_data = mask_generator.process_single_frame(
             img, pts, human_boxes
         )
         
-        # Save results
+        print(f"\nNeck info: {neck_info}")
+        # Save results and visualizations
         save_masks_and_visualizations(
-            img, fn, args.data_dir, best_mask, best_head_mask, head_points, head_bbox
+            img, 
+            os.path.basename(fn), 
+            args.data_dir, 
+            best_mask, 
+            best_head_mask, 
+            head_points, 
+            head_bbox,
+            neck_info  # Make sure to pass neck_info here
         )
         
         # Add human detection debug data

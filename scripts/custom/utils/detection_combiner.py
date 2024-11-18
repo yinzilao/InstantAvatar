@@ -84,11 +84,15 @@ def validate_combined_detection(final_bbox, confidence, image_shape):
         print("Head bbox too small")
         return None, 0.0
     
-    # Validate aspect ratio (width/height)
+    # More lenient aspect ratio validation for different hairstyles
     aspect_ratio = width / height
-    if aspect_ratio < 0.5 or aspect_ratio > 2.0:
-        print(f"Invalid head aspect ratio: {aspect_ratio:.2f}")
+    if aspect_ratio < 0.3 or aspect_ratio > 5.0:  # Wider range for unusual hairstyles
+        print(f"Extreme head aspect ratio: {aspect_ratio:.2f}")
         return None, 0.0
+    # elif aspect_ratio < 0.5 or aspect_ratio > 3:
+    #     # For moderately unusual ratios, reduce confidence but don't reject
+    #     print(f"Unusual head aspect ratio: {aspect_ratio:.2f}, reducing confidence")
+    #     confidence *= 0.8
     
     # Validate position relative to image
     center_y = (final_bbox[1] + final_bbox[3]) / 2

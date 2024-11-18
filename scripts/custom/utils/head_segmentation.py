@@ -3,12 +3,13 @@ import numpy as np
 from skimage import filters
 from skimage import morphology
 import os
+from scipy import ndimage
 
 class HairSegmenter:
     def __init__(self):
         self.color_threshold = 45
         self.texture_threshold = 0.4
-        self.min_hair_area = 50
+        self.min_hair_area = 100  # Minimum area for connected components
         
     def get_validated_hair_mask(self, image, face_mask, head_bbox, confidence):
         """Hair segmentation with validation pipeline"""
@@ -132,19 +133,25 @@ class HairSegmenter:
             hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
             gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             
+            # Clip bbox to image boundaries
+            h, w = image.shape[:2]
+            y1 = max(0, int(bbox[1]))
+            x1 = max(0, int(bbox[0]))
+            y2 = min(h, int(bbox[3]))
+            x2 = min(w, int(bbox[2]))
+            
             # Texture detection with stricter threshold
             gradient_x = filters.sobel_h(gray_image)
             gradient_y = filters.sobel_v(gray_image)
             gradient = np.sqrt(gradient_x**2 + gradient_y**2)
             texture_mask = gradient > np.percentile(gradient, 60)  # Increased threshold
             
-            # Strict spatial mask (only above face)
-            y1, x1, y2, x2 = map(int, bbox)
+            # Create spatial mask relative to clipped bbox
             spatial_mask = np.zeros_like(gray_image, dtype=bool)
             head_height = y2 - y1
             spatial_mask[
-                max(0, y1-int(head_height*0.7)):y1+int(head_height*0.3),  # Reduced vertical range
-                max(0, x1-int((x2-x1)*0.2)):min(spatial_mask.shape[1], x2+int((x2-x1)*0.2))  # Reduced horizontal padding
+                max(0, y1):min(h, y1+int(head_height)),  # Only above face
+                max(0, x1-int((x2-x1)*0.2)):min(w, x2+int((x2-x1)*0.2))
             ] = 1
             
             # Combine masks
@@ -205,10 +212,14 @@ class HairSegmenter:
         if hair_mask is None:
             return None
             
+        # Filter disconnected components first
+        filtered_mask = self.filter_connected_components(hair_mask, face_mask)
+        
+        # Continue with existing validation logic using filtered_mask
         bbox = np.clip(bbox, 0, None)
         bbox = np.round(bbox).astype(int)
         
-        hair_area = float(np.sum(hair_mask))
+        hair_area = float(np.sum(filtered_mask))
         face_area = float(np.sum(face_mask))
         
         if face_area > 0:
@@ -223,7 +234,7 @@ class HairSegmenter:
             # Don't return None, continue processing
         
         # More flexible position validation
-        hair_points = np.where(hair_mask)
+        hair_points = np.where(filtered_mask)
         if len(hair_points[0]) == 0:
             return None
             
@@ -239,4 +250,28 @@ class HairSegmenter:
             print(f"Low confidence detection: {confidence:.2f}")
             return None
             
-        return hair_mask
+        return filtered_mask
+        
+    def filter_connected_components(self, mask, face_mask):
+        """Filter hair mask components based on connectivity to face"""
+        # Label connected components
+        labeled_array, num_features = ndimage.label(mask)
+        
+        # Dilate face mask to check for connectivity
+        dilated_face = morphology.dilation(face_mask, morphology.disk(3))
+        
+        # Keep track of valid components
+        valid_mask = np.zeros_like(mask, dtype=bool)
+        
+        for i in range(1, num_features + 1):
+            component = labeled_array == i
+            component_area = np.sum(component)
+            
+            # Check if component touches dilated face mask
+            touches_face = np.any(component & dilated_face)
+            
+            # Keep component if it's large enough and connected to face
+            if touches_face and component_area > self.min_hair_area:
+                valid_mask |= component
+                
+        return valid_mask
