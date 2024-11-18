@@ -185,18 +185,19 @@ def create_head_mask(keypoints, box, predictor, masked_image, frame_idx,
         try:
             face_bbox, face_conf, face_debug = face_detector.get_head_bbox(
                 masked_image, 
-                final_bbox if keypoint_conf > 0.3 else None
+                final_bbox
             )
         except ValueError:
             print("Face detection returned invalid format")
             face_bbox, face_conf, face_debug = None, 0.0, {'error': 'Invalid return format'}
-            
-        # 3. Get previous detection from tracker
-        prev_bbox, prev_conf = head_tracker.get_last_detection()
-        if prev_bbox is not None:
-            print(f"Previous detection - Confidence: {prev_conf:.3f}")
-        else:
-            print("No previous detection found")
+        
+        prev_bbox, prev_conf = None, 0.0
+        # # 3. Get previous detection from tracker
+        # prev_bbox, prev_conf = head_tracker.get_last_detection()
+        # if prev_bbox is not None:
+        #     print(f"Previous detection - Confidence: {prev_conf:.3f}")
+        # else:
+        #     print("No previous detection found")
         
         # 4. Combine detections with confidence weighting
         final_bbox, confidence, combiner_debug = combine_detections(

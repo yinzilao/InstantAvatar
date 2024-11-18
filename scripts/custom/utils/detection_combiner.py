@@ -9,25 +9,30 @@ def combine_detections(keypoint_bbox, keypoint_conf, face_bbox, face_conf, prev_
     weights = []
     
     # Add keypoint detection if valid
-    if keypoint_bbox is not None and keypoint_conf > 0.3:
+    if keypoint_bbox is not None and keypoint_conf > 0.2:
         valid_boxes.append(keypoint_bbox)
         confidences.append(keypoint_conf)
-        weights.append(1.0)  # Base weight for keypoints
+        weights.append(1.2)  # Higher weight for keypoints
+    else:
+        print("  ✗ Keypoint detection not valid")
+        # Add face detection if valid
+        if face_bbox is not None and face_conf > 0.5:
+            valid_boxes.append(face_bbox)
+            confidences.append(face_conf)
+            weights.append(1.0)  # Base weight for face detection
+        else:
+            print("  ✗ Face detection not valid")
         
-    # Add face detection if valid
-    if face_bbox is not None and face_conf > 0.3:
-        valid_boxes.append(face_bbox)
-        confidences.append(face_conf)
-        weights.append(1.2)  # Higher weight for face detection
-        
-    # Add previous detection for temporal consistency
-    if prev_bbox is not None and prev_conf > 0.2:
-        valid_boxes.append(prev_bbox)
-        confidences.append(prev_conf)
-        weights.append(0.8)  # Lower weight for temporal consistency
+            # Add previous detection for temporal consistency
+            if prev_bbox is not None and prev_conf > 0.7:
+                valid_boxes.append(prev_bbox)
+                confidences.append(prev_conf)
+                weights.append(0.8)  # Lower weight for temporal consistency
+            else:
+                print("  ✗ Previous detection not valid")
         
     if not valid_boxes:
-        return None, 0.0
+        return None, 0.0, {}
         
     # Calculate final weights
     confidences = np.array(confidences)

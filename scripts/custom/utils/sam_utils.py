@@ -194,68 +194,103 @@ class HeadPointEstimator:
         print("\nHead BBox Estimation Debug:")
         
         def estimate_head_orientation():
-            """Estimate head orientation from available keypoints"""
+            """Estimate head orientation using OpenPose keypoints"""
             orientation = {
                 'facing': 'front',  # default
+                'direction': 'center',  # left/right/center of image
                 'confidence': 0.0
             }
             
-            # Check left-right keypoint pairs
-            pairs = [
-                ('left_eye', 'right_eye'),
-                ('left_ear', 'right_ear')
-            ]
+            # First determine if person is facing camera or away
+            # Use nose and neck visibility
+            nose_conf = self.keypoints[KEYPOINT_INDICES['nose'], 2]
+            neck_conf = self.keypoints[KEYPOINT_INDICES['neck'], 2]
             
-            visible_pairs = []
-            for left, right in pairs:
-                left_idx = HEAD_KEYPOINT_INDICES[left]
-                right_idx = HEAD_KEYPOINT_INDICES[right]
-                
-                left_visible = self.keypoints[left_idx, 2] > 0.5
-                right_visible = self.keypoints[right_idx, 2] > 0.5
-                
-                if left_visible and not right_visible:
-                    orientation['facing'] = 'left' # left of the image, right side of the head
-                    orientation['confidence'] += 0.5
-                elif right_visible and not left_visible:
-                    orientation['facing'] = 'right' # right of the image, left side of the head
-                    orientation['confidence'] += 0.5
-                elif left_visible and right_visible:
-                    orientation['facing'] = 'front'
-                    orientation['confidence'] += 1.0
-                    
-                if left_visible or right_visible:
-                    visible_pairs.append((left_idx, right_idx))
+            # If nose is not visible but neck is, likely facing away
+            if nose_conf < 0.5 and neck_conf > 0.5:
+                orientation['facing'] = 'back'
+                orientation['confidence'] += 0.8
+            elif nose_conf > 0.5:
+                orientation['facing'] = 'front'
+                orientation['confidence'] += 0.8
             
-            print(f"Estimated orientation: {orientation}")
-            return orientation, visible_pairs
+            # Determine left/right direction in image space
+            left_points = {
+                'ear': self.keypoints[KEYPOINT_INDICES['left_ear'], 2],
+                'eye': self.keypoints[KEYPOINT_INDICES['left_eye'], 2],
+                'shoulder': self.keypoints[KEYPOINT_INDICES['left_shoulder'], 2]
+            }
+            
+            right_points = {
+                'ear': self.keypoints[KEYPOINT_INDICES['right_ear'], 2],
+                'eye': self.keypoints[KEYPOINT_INDICES['right_eye'], 2],
+                'shoulder': self.keypoints[KEYPOINT_INDICES['right_shoulder'], 2]
+            }
+            
+            # Count visible points on each side
+            left_visible = sum(1 for conf in left_points.values() if conf > 0.5)
+            right_visible = sum(1 for conf in right_points.values() if conf > 0.5)
+            
+            if left_visible > right_visible:
+                orientation['direction'] = 'left'
+                orientation['confidence'] += 0.5
+            elif right_visible > left_visible:
+                orientation['direction'] = 'right'
+                orientation['confidence'] += 0.5
+            
+            print(f"Orientation detection:")
+            print(f"- Facing: {orientation['facing']}")
+            print(f"- Direction: {orientation['direction']}")
+            print(f"- Confidence: {orientation['confidence']}")
+            
+            return orientation
         
         def get_adaptive_padding(orientation):
             """Get adaptive padding based on head orientation"""
+            print("\nAdaptive Padding Debug:")
+            print(f"Input orientation: {orientation}")
+            
             base_padding = {
                 'top': 1.0,    # More space for hair
                 'bottom': 0.0, # Less space below face
                 'left': 0.5,   # Medium space for sides
                 'right': 0.5
             }
+            print(f"Initial base padding: {base_padding}")
             
-            # Adjust padding based on orientation - Increase back-of-head padding
-            if orientation['facing'] == 'left':
-                base_padding['left'] *= 0.3    # Less padding on visible side
-                base_padding['right'] *= 2.0   # More padding for back of head (increased from 1.5)
-            elif orientation['facing'] == 'right':
-                base_padding['right'] *= 0.3
-                base_padding['left'] *= 2.0    # More padding for back of head (increased from 1.5)
-                
-            # # Scale padding by orientation confidence
-            # confidence_scale = 0.5 + (orientation['confidence'] * 0.5)
-            # for key in base_padding:
-            #     base_padding[key] *= confidence_scale
-                
+            # Adjust padding based on orientation
+            if orientation['facing'] == 'front':
+                print("Case: Front facing")
+                # For front-facing, pad more on the occluded side
+                if orientation['direction'] == 'left':
+                    print("Direction: Left - Adjusting padding")
+                    base_padding['right'] *= 2.0  # More padding on right
+                    base_padding['left'] *= 0.5   # Less padding on visible side
+                    print(f"After adjustment: {base_padding}")
+                elif orientation['direction'] == 'right':
+                    print("Direction: Right - Adjusting padding")
+                    base_padding['left'] *= 2.0   # More padding on left
+                    base_padding['right'] *= 0.5  # Less padding on visible side
+                    print(f"After adjustment: {base_padding}")
+            else:  # facing back
+                print("Case: Back facing")
+                # For back-facing, pad more on the opposite side of visible direction
+                if orientation['direction'] == 'left':
+                    print("Direction: Left - Adjusting padding")
+                    base_padding['right'] *= 2.0  # More padding where face extends
+                    base_padding['left'] *= 0.5   # Less padding on back of head
+                    print(f"After adjustment: {base_padding}")
+                elif orientation['direction'] == 'right':
+                    print("Direction: Right - Adjusting padding")
+                    base_padding['left'] *= 2.0   # More padding where face extends
+                    base_padding['right'] *= 0.5  # Less padding on back of head
+                    print(f"After adjustment: {base_padding}")
+            
+            print(f"Final padding values: {base_padding}")
             return base_padding
         
         # Get head orientation
-        orientation, visible_pairs = estimate_head_orientation()
+        orientation = estimate_head_orientation()
         
         # Collect relevant points
         relevant_points = []
@@ -314,13 +349,36 @@ class HeadPointEstimator:
         width = max_xy[0] - min_xy[0]
         height = max_xy[1] - min_xy[1]
         
-        # Apply adaptive padding
-        bbox = np.array([
-            min_xy[0] - width * padding['left'],
-            min_xy[1] - height * padding['top'],
-            max_xy[0] + width * padding['right'],
-            max_xy[1] + height * padding['bottom']
-        ])
+        # Find nose and neck points
+        nose_point = None
+        neck_point = None
+        
+        # Get nose point
+        if KEYPOINT_INDICES['nose'] < len(self.keypoints) and self.keypoints[KEYPOINT_INDICES['nose'], 2] > 0.5:
+            nose_point = self.keypoints[KEYPOINT_INDICES['nose'], :2]
+        
+        # Get neck point
+        if KEYPOINT_INDICES['neck'] < len(self.keypoints) and self.keypoints[KEYPOINT_INDICES['neck'], 2] > 0.5:
+            neck_point = self.keypoints[KEYPOINT_INDICES['neck'], :2]
+        
+        # Calculate vertical bounds based on nose-neck distance
+        if nose_point is not None and neck_point is not None:
+            nose_neck_distance = np.linalg.norm(nose_point - neck_point)
+            bbox = np.array([
+                min_xy[0] - width * padding['left'],
+                nose_point[1] - nose_neck_distance * 1.2,  # Top of head
+                max_xy[0] + width * padding['right'],
+                nose_point[1] + nose_neck_distance * 0.7   # Bottom of head
+            ])
+        else:
+            # Fallback to original calculation if nose or neck not detected
+            height = max_xy[1] - min_xy[1]
+            bbox = np.array([
+                min_xy[0] - width * padding['left'],
+                min_xy[1] - height * padding['top'],
+                max_xy[0] + width * padding['right'],
+                max_xy[1] + height * padding['bottom']
+            ])
         
         print(f"  ✓ Generated head bbox with adaptive padding: {bbox}")
         print(f"  ✓ Padding ratios: {padding}")
@@ -362,229 +420,3 @@ class HeadPointEstimator:
                           for conf, name in zip(confidences, self.available_points.keys()))
         
         return weighted_conf / total_weight
-
-class HeadTracker:
-    def __init__(self, history_length=5):
-        """Initialize temporal tracker"""
-        self.history = deque(maxlen=history_length)
-        self.frame_idx = 0
-        self.smooth_window = 3
-        
-    def update(self, bbox, mask, confidence):
-        """Update tracker with new detection"""
-        if bbox is None or mask is None:
-            self.frame_idx += 1
-            return
-            
-        # Store detection
-        detection = {
-            'bbox': bbox.copy(),
-            'mask': mask.copy(),
-            'confidence': confidence,
-            'frame_idx': self.frame_idx
-        }
-        self.history.append(detection)
-        
-        # Save debug visualizations
-        debug_dir = os.path.join("debug_images", f"frame_{self.frame_idx:05d}", "temporal_tracker")
-        os.makedirs(debug_dir, exist_ok=True)
-
-        # Save tracking history visualization
-        if len(self.history) > 1:
-            # Create blank canvas for visualization
-            h, w = mask.shape[:2]
-            track_vis = np.zeros((h, w, 3), dtype=np.uint8)
-            
-            # Different colors for temporal tracking
-            colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255)]
-            
-            # Show last 3 detections with different colors
-            for i, det in enumerate(list(self.history)[-3:]):
-                bbox = det['bbox']
-                mask = det['mask']
-                color = colors[i % len(colors)]
-                
-                # Draw mask
-                track_vis[mask] = color
-                
-                # Draw bbox
-                cv2.rectangle(track_vis, 
-                            (int(bbox[0]), int(bbox[1])), 
-                            (int(bbox[2]), int(bbox[3])), 
-                            color, 2)
-                
-                # Add confidence text
-                cv2.putText(track_vis, 
-                           f"conf: {det['confidence']:.2f}", 
-                           (int(bbox[0]), int(bbox[1]-5)), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 
-                           0.5, color, 1)
-            
-            cv2.imwrite(os.path.join(debug_dir, "tracking_history.png"), track_vis)
-            
-            # Save individual detection crops
-            for i, det in enumerate(list(self.history)[-3:]):
-                bbox = det['bbox']
-                y1, y2 = max(0, int(bbox[1])), min(h, int(bbox[3]))
-                x1, x2 = max(0, int(bbox[0])), min(w, int(bbox[2]))
-                if y2 > y1 and x2 > x1:
-                    crop = track_vis[y1:y2, x1:x2]
-                    cv2.imwrite(os.path.join(debug_dir, f"detection_{i}_crop.png"), crop)
-        
-        self.frame_idx += 1
-    
-    def get_last_detection(self):
-        """Get most recent valid detection"""
-        if not self.history:
-            return None, 0.0
-            
-        last_det = self.history[-1]
-        return last_det['bbox'], last_det['confidence']
-    
-    def get_smooth_prediction(self):
-        """Get temporally smoothed prediction"""
-        if len(self.history) < 2:
-            return None, None, 0.0
-            
-        # Get recent detections for smoothing
-        recent_dets = list(self.history)[-self.smooth_window:]
-        if not recent_dets:
-            return None, None, 0.0
-            
-        # Calculate confidence-weighted average for bbox
-        total_weight = 0
-        weighted_bbox = np.zeros(4)
-        
-        for det in recent_dets:
-            weight = det['confidence'] * (0.8 ** (self.frame_idx - det['frame_idx']))
-            weighted_bbox += det['bbox'] * weight
-            total_weight += weight
-            
-        if total_weight == 0:
-            return None, None, 0.0
-            
-        smooth_bbox = weighted_bbox / total_weight
-        
-        # Combine masks with temporal decay
-        h, w = recent_dets[0]['mask'].shape
-        smooth_mask = np.zeros((h, w), dtype=bool)
-        total_weight = 0
-        
-        for det in recent_dets:
-            weight = det['confidence'] * (0.8 ** (self.frame_idx - det['frame_idx']))
-            smooth_mask |= det['mask']  # Union of recent masks
-            total_weight += weight
-            
-        # Calculate smoothed confidence
-        smooth_conf = total_weight / len(recent_dets)
-        
-        # Save smoothing debug visualization
-        debug_dir = os.path.join("debug_images", f"frame_{self.frame_idx:05d}", 
-                                "temporal_tracker", "smoothing")
-        os.makedirs(debug_dir, exist_ok=True)
-        
-        # Visualize smoothed result
-        smooth_vis = np.zeros((h, w, 3), dtype=np.uint8)
-        smooth_vis[smooth_mask] = (0, 255, 0)  # Green for smoothed mask
-        cv2.rectangle(smooth_vis, 
-                     (int(smooth_bbox[0]), int(smooth_bbox[1])), 
-                     (int(smooth_bbox[2]), int(smooth_bbox[3])), 
-                     (255, 255, 0), 2)  # Yellow for smoothed bbox
-        cv2.putText(smooth_vis, 
-                   f"smooth conf: {smooth_conf:.2f}", 
-                   (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 
-                   1, (255, 255, 255), 2)
-        
-        cv2.imwrite(os.path.join(debug_dir, "smoothed_prediction.png"), smooth_vis)
-        
-        return smooth_bbox, smooth_mask, smooth_conf
-    
-    def validate_temporal_consistency(self, bbox, mask, confidence):
-        """Validate detection against temporal history"""
-        if not self.history:
-            return bbox, mask, confidence
-            
-        last_det = self.history[-1]
-        
-        # Calculate IoU with previous detection
-        iou = self.calculate_bbox_iou(bbox, last_det['bbox'])
-        
-        # Calculate mask overlap
-        if mask is not None and last_det['mask'] is not None:
-            mask_overlap = np.sum(mask & last_det['mask']) / np.sum(mask | last_det['mask'])
-        else:
-            mask_overlap = 0
-            
-        # Adjust confidence based on temporal consistency
-        temporal_conf = min(1.0, confidence * (0.5 + 0.5 * iou) * (0.5 + 0.5 * mask_overlap))
-        
-        # Save validation debug visualization
-        debug_dir = os.path.join("debug_images", f"frame_{self.frame_idx:05d}", 
-                                "temporal_tracker", "validation")
-        os.makedirs(debug_dir, exist_ok=True)
-        
-        h, w = mask.shape
-        valid_vis = np.zeros((h, w, 3), dtype=np.uint8)
-        
-        # Draw previous detection in red
-        valid_vis[last_det['mask']] = (0, 0, 255)
-        cv2.rectangle(valid_vis, 
-                     (int(last_det['bbox'][0]), int(last_det['bbox'][1])), 
-                     (int(last_det['bbox'][2]), int(last_det['bbox'][3])), 
-                     (0, 0, 255), 2)
-        
-        # Draw current detection in green
-        valid_vis[mask] = (0, 255, 0)
-        cv2.rectangle(valid_vis, 
-                     (int(bbox[0]), int(bbox[1])), 
-                     (int(bbox[2]), int(bbox[3])), 
-                     (0, 255, 0), 2)
-        
-        # Add metrics text
-        cv2.putText(valid_vis, 
-                   f"IoU: {iou:.2f}", 
-                   (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 
-                   1, (255, 255, 255), 2)
-        cv2.putText(valid_vis, 
-                   f"Mask Overlap: {mask_overlap:.2f}", 
-                   (10, 60), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 
-                   1, (255, 255, 255), 2)
-        cv2.putText(valid_vis, 
-                   f"Temporal Conf: {temporal_conf:.2f}", 
-                   (10, 90), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 
-                   1, (255, 255, 255), 2)
-        
-        cv2.imwrite(os.path.join(debug_dir, "temporal_validation.png"), valid_vis)
-        
-        return bbox, mask, temporal_conf
-    
-    def calculate_bbox_iou(self, box1, box2):
-        """Calculate IoU between two bounding boxes"""
-        # Convert to numpy arrays
-        box1 = np.array(box1)
-        box2 = np.array(box2)
-        
-        # Get coordinates of intersection
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-        
-        # Calculate area of intersection
-        intersection_area = max(0, x2 - x1) * max(0, y2 - y1)
-        
-        # Calculate areas of both boxes
-        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        
-        # Calculate union area
-        union_area = box1_area + box2_area - intersection_area
-        
-        # Return IoU
-        if union_area == 0:
-            return 0.0
-        return intersection_area / union_area

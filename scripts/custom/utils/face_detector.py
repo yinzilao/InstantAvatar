@@ -27,7 +27,7 @@ class FaceDetector:
             if not results.detections:
                 print("No face detected by MediaPipe")
                 # Use SAM bbox with lower confidence
-                return keypoint_bbox, 0.4, {'detections': []}
+                return keypoint_bbox, 0.3, {'detections': []}
             
             # Get highest confidence face detection
             detection = max(results.detections, key=lambda x: x.score[0])
@@ -35,11 +35,17 @@ class FaceDetector:
             # Convert MediaPipe bbox to absolute coordinates
             bbox = detection.location_data.relative_bounding_box
             h, w = image.shape[:2]
+            
+            # Get nose and face height from MediaPipe detection
+            nose_y = detection.location_data.relative_keypoints[2].y * h  # MediaPipe nose keypoint
+            face_height = bbox.height * h
+            
+            # Calculate vertical bounds using nose as reference
             face_bbox = [
-                bbox.xmin * w,
-                bbox.ymin * h,
-                (bbox.xmin + bbox.width) * w,
-                (bbox.ymin + bbox.height) * h
+                bbox.xmin * w,  # Keep horizontal calculations
+                nose_y - face_height * 1.2,  # Top of head
+                (bbox.xmin + bbox.width) * w,  # Keep horizontal calculations
+                nose_y + face_height * 0.7  # Bottom of head
             ]
             
             # Calculate IoU with SAM bbox
@@ -49,7 +55,7 @@ class FaceDetector:
             # Always return SAM bbox, but adjust confidence based on face detection
             if iou < 0.1:
                 # Low IoU - use SAM bbox with lower confidence
-                confidence = 0.4
+                confidence = 0.3
             else:
                 # High IoU - use face detection confidence
                 confidence = detection.score[0]
