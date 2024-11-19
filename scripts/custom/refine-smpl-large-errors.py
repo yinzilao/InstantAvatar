@@ -4,9 +4,7 @@ from tqdm import tqdm
 import os
 import glob
 import sys
-
-# Add the project root to Python path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
@@ -22,9 +20,6 @@ from pytorch3d.renderer import (
 from pytorch3d.structures import Meshes
 from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_euler_angles
 import trimesh
-
-from segment_anything import sam_model_registry, SamPredictor
-from scripts.custom.run_sam import get_human_boxes, get_points_in_box, CHECKPOINT, MODEL, sam_model_registry
 
 DEVICE = "cuda"
 
@@ -67,6 +62,8 @@ def build_renderer(camera, IMG_SIZE):
         image_size=IMG_SIZE,
         blur_radius=np.log(1. / 1e-4 - 1.) * blend_params.sigma,
         faces_per_pixel=100,
+        bin_size=0,  # Set to 0 to use naive rasterization
+        max_faces_per_bin=50000  # Increase this value
     )
 
     renderer = MeshRenderer(
@@ -463,9 +460,6 @@ def anatomical_pose_prior(body_pose):
     euler_angles = matrix_to_euler_angles(pose_mat, "XYZ")
     euler_angles = euler_angles.reshape(batch_size, -1, 3)
 
-    # Debug print to understand the joint structure
-    print(f"SMPL euler angles shape: {euler_angles.shape}")  # Should be [batch_size, 23, 3]
-    
     # Create reverse mapping from SMPL index to BODY25 joint name
     smpl_to_body25_joint = {}
     for body25_idx, joint_name in enumerate(joints_name):
@@ -509,12 +503,7 @@ def angle_magnitude_prior(body_pose):
     return excess.mean()
 
 @torch.no_grad()
-def main(root, gender, keypoints_threshold, use_silhouette, downscale=1):
-    # Use same SAM initialization as run-sam.py
-    sam = sam_model_registry[MODEL](checkpoint=CHECKPOINT)
-    sam.to(DEVICE)
-    sam_predictor = SamPredictor(sam)
-    
+def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1):
     camera = dict(np.load(f"{root}/cameras.npz"))
     if downscale > 1:
         camera["intrinsic"][:2] /= downscale
@@ -580,9 +569,9 @@ def main(root, gender, keypoints_threshold, use_silhouette, downscale=1):
         print(f"Projected keypoints shape: {keypoints_pred.shape}")
         print(f"Target keypoints shape: {keypoints_2d[..., :2].shape}")
 
-	# Add lower weights for head keypoints
+        # Add lower weights for head keypoints
         keypoint_weights = torch.ones_like(keypoints_2d[..., 0])
-        keypoint_weights[..., HEAD_KEYPOINT_INDICES] = 0.3  # Reduce influence of head keypoints
+        keypoint_weights[..., HEAD_KEYPOINT_INDICES] = 0.01  # Reduce influence of head keypoints
         
         # 1. Input normalization
         keypoints_norm = keypoints_2d[..., :2] / torch.tensor([W, H], device=DEVICE)
@@ -631,6 +620,7 @@ def main(root, gender, keypoints_threshold, use_silhouette, downscale=1):
         torch.nn.utils.clip_grad_norm_(params.values(), max_norm=0.1)
         
         return total_loss
+    
     optimize(optimizer, closure, max_iter=200)
 
     # After first optimization
@@ -641,9 +631,33 @@ def main(root, gender, keypoints_threshold, use_silhouette, downscale=1):
     for k, v in params.items():
         print(f"  {k}: {v.shape} (min: {v.min().item():.3f}, max: {v.max().item():.3f})")
 
+    def create_headless_mesh(smpl_output, body_model):
+        vertices_no_head = smpl_output.vertices.clone()
+        
+        # Get neck joint position (joint 12 in SMPL)
+        neck_joint_y = smpl_output.joints[0, 12, 1]  # Y coordinate of neck joint
+        
+        # Create mask for vertices above neck joint
+        vertices_above_neck = vertices_no_head[0, :, 1] > neck_joint_y
+        HEAD_VERTEX_IDS = torch.where(vertices_above_neck)[0].tolist()
+        
+        # Move head vertices far away
+        vertices_no_head[..., HEAD_VERTEX_IDS, :] = torch.tensor([0., -1000., -1000.], device=DEVICE)
+        
+        # Get faces that contain any of the head vertices
+        faces = body_model.faces_tensor[None].repeat(1, 1, 1)
+        head_faces_mask = torch.any(torch.isin(faces, torch.tensor(HEAD_VERTEX_IDS, device=DEVICE)), dim=-1)
+        
+        # Remove faces connected to head vertices
+        faces_no_head = faces.clone()
+        faces_no_head[..., head_faces_mask, :] = 0
+        
+        return vertices_no_head, faces_no_head
+
     if use_silhouette:
+        silhouette_debug = True
         # Load pre-generated body-only masks
-        masks = sorted(glob.glob(f"{root}/masks_body_only/*"))
+        masks = sorted(glob.glob(f"{root}/body_only_masks_schp/*"))
         masks = [cv2.imread(p)[..., 0] for p in masks]
         if downscale > 1:
             masks = [cv2.resize(m, dsize=None, fx=1/downscale, fy=1/downscale) 
@@ -658,16 +672,19 @@ def main(root, gender, keypoints_threshold, use_silhouette, downscale=1):
         img_size = masks[0].shape[:2]
         renderer = build_renderer(camera, img_size)
 
+        if silhouette_debug:
+            # Create debug directory
+            debug_dir = os.path.join(root, "refine-smpl", "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+
         for i in range(len(masks)):
             mask = torch.from_numpy(masks[i:i+1]).float().to(DEVICE) / 255
-            print(f"\nFrame {i}:")
-            print(f"Mask sum: {mask.sum()}")  # Should be > 0
-
+            
             optimizer = torch.optim.LBFGS(params.values(), line_search_fn="strong_wolfe")
             def closure():
                 optimizer.zero_grad()
 
-                # silhouette loss
+                # Get SMPL output
                 smpl_output = body_model(
                     betas=params["betas"].clone().detach(),
                     global_orient=params["global_orient"][i:i+1],
@@ -675,23 +692,84 @@ def main(root, gender, keypoints_threshold, use_silhouette, downscale=1):
                     transl=params["transl"][i:i+1],
                 )
 
-                print(f"Optimized vertices min/max: {smpl_output.vertices.min():.3f}/{smpl_output.vertices.max():.3f}")
+                # Create headless mesh
+                vertices_no_head, faces_no_head = create_headless_mesh(smpl_output, body_model)
 
-                # keypoints loss
+                # Create meshes for both full body and headless
+                meshes_full = Meshes(
+                    verts=smpl_output.vertices,
+                    faces=body_model.faces_tensor[None].repeat(1, 1, 1),
+                ).to(DEVICE)
+
+                meshes_no_head = Meshes(
+                    verts=vertices_no_head,
+                    faces=faces_no_head,
+                ).to(DEVICE)
+
+                # Render both silhouettes
+                silhouette_full = renderer(meshes_full)[..., 3]
+                silhouette_no_head = renderer(meshes_no_head)[..., 3]
+
+                # Compare both silhouettes with the mask
+                loss_silhouette_full = F.mse_loss(mask, silhouette_full)
+                loss_silhouette_no_head = F.mse_loss(mask, silhouette_no_head)
+
+                # Save debug images after losses are calculated
+                if silhouette_debug and i % 10 == 0:  # Save every 10th frame
+                    # Convert tensors to numpy for visualization
+                    sil_full = silhouette_full.detach().cpu().numpy()[0]
+                    sil_no_head = silhouette_no_head.detach().cpu().numpy()[0]
+                    mask_np = mask.detach().cpu().numpy()[0]
+                    
+                    # Create difference images
+                    diff_full = np.abs(sil_full - mask_np)
+                    diff_no_head = np.abs(sil_no_head - mask_np)
+                    
+                    # Create visualization grid
+                    plt.figure(figsize=(20, 10))
+                    
+                    plt.subplot(231)
+                    plt.imshow(mask_np)
+                    plt.title('Target Mask')
+                    plt.axis('off')
+                    
+                    plt.subplot(232)
+                    plt.imshow(sil_full)
+                    plt.title('Full Silhouette')
+                    plt.axis('off')
+                    
+                    plt.subplot(233)
+                    plt.imshow(sil_no_head)
+                    plt.title('No-Head Silhouette')
+                    plt.axis('off')
+                    
+                    plt.subplot(235)
+                    plt.imshow(diff_full, cmap='hot')
+                    plt.title('Full Difference')
+                    plt.colorbar()
+                    plt.axis('off')
+                    
+                    plt.subplot(236)
+                    plt.imshow(diff_no_head, cmap='hot')
+                    plt.title('No-Head Difference')
+                    plt.colorbar()
+                    plt.axis('off')
+                    
+                    plt.suptitle(f'Frame {i} - Loss Full: {loss_silhouette_full:.4f}, Loss No-Head: {loss_silhouette_no_head:.4f}')
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(debug_dir, f'silhouette_comparison_{i:04d}.png'))
+                    plt.close()
+
+                # Use the better matching silhouette
+                loss_silhouette = torch.minimum(loss_silhouette_full, loss_silhouette_no_head)
+
+                # Rest of the loss computation
                 keypoints_pred = project(projection_matrices, joint_mapper(smpl_output))
                 loss_keypoints = (keypoints_2d[i:i+1, :, :2] - keypoints_pred).square().sum(-1).sqrt()
-
+                
                 m1 = (keypoints_2d[i:i+1, :, 2] > 0)
                 loss_keypoints = (loss_keypoints * m1.float()).mean()
 
-                meshes = Meshes(
-                    verts=smpl_output.vertices,
-                    faces=body_model.faces_tensor[None].repeat(1, 1, 1),
-                )
-                silhouette = renderer(meshes)[..., 3]
-                loss_silhouette = F.mse_loss(mask, silhouette)
-
-                # Add anatomical pose prior
                 anatomical_loss = anatomical_pose_prior(params['body_pose'][i:i+1])
                 magnitude_prior = angle_magnitude_prior(params['body_pose'])
                 
@@ -731,4 +809,4 @@ if __name__ == "__main__":
     parser.add_argument("--silhouette", action="store_true")
     parser.add_argument("--downscale", type=float, default=1.0)
     args = parser.parse_args()
-    main(args.data_dir, args.gender, args.keypoints_threshold, args.silhouette, args.downscale)
+    main(args.data_dir, args.keypoints_threshold, args.silhouette, args.gender, args.downscale)
