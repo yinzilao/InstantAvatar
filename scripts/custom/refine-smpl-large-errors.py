@@ -26,10 +26,34 @@ DEVICE = "cuda"
 
 def optimize(optimizer, closure, max_iter=10):
     pbar = tqdm(range(max_iter))
+    prev_loss = float('inf')
+    best_loss = None
+    patience = 3
+    patience_counter = 0
+    min_improvement = 1e-6
+    
     for i in pbar:
         loss = optimizer.step(closure)
-        pbar.set_postfix_str(f"loss: {loss.detach().cpu().numpy():.6f}")
+        current_loss = loss.detach().cpu().numpy()
 
+        # Initialize best_loss on first iteration
+        if best_loss is None:
+            best_loss = current_loss
+        
+        # Early stopping
+        improvement = (prev_loss - current_loss) / (prev_loss + 1e-10)  # Avoid division by zero
+        if abs(improvement) < min_improvement:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered at iteration {i}, best loss: {best_loss:.6f}")
+                break
+        else:
+            patience_counter = 0
+            if current_loss < best_loss:
+                best_loss = current_loss
+            
+        prev_loss = current_loss
+        pbar.set_postfix_str(f"loss: {current_loss:.6f}")
 
 def project(projection_matrices, keypoints_3d):
     p = torch.einsum("ij,mnj->mni", projection_matrices[:3, :3], keypoints_3d) + projection_matrices[:3, 3]
@@ -41,10 +65,10 @@ def build_renderer(camera, IMG_SIZE):
     K = camera["intrinsic"]
     K = torch.from_numpy(K).float().to(DEVICE)
 
-    R = torch.eye(3, device=DEVICE)[None]
+    R = torch.eye(3, device=DEVICE, dtype=torch.float32)[None]
     R[:, 0] *= -1
     R[:, 1] *= -1
-    t = torch.zeros(1, 3, device=DEVICE)
+    t = torch.zeros(1, 3, device=DEVICE, dtype=torch.float32)
 
 
     cameras = PerspectiveCameras(
@@ -210,14 +234,28 @@ def temporal_smoothness_loss(vertices, window_size=3, loss_downgrade=1.0):
             continue
         # Compare frame t with frame t-i
         diff = vertices[i:] - vertices[:-i]
-        print(f"diff.shape: {diff.shape}")
+
+        # Clip extremely large differences to prevent explosion
+        diff = torch.clamp(diff, min=-100.0, max=100.0)
+        print(f"WARNING: frame diff clipped to: {diff}")
+
         # L1 loss for more robustness
-        loss = diff.abs().mean()
-	    # reg = vertices_diff.abs().mean(-1)  # L1 norm # check whether we need mean(-1).mean() or just mean()
-        # reg_loss = reg.mean() * loss_downgrade
+        loss = diff.abs().mean(dim=-1)  # Mean across xyz dimensions
+        loss = loss.mean()  # Mean across vertices
+
+        # Add small epsilon to prevent division by zero
+        weight = (1.0 / (i + 1e-6))
+
         # Weight decreases with temporal distance
-        total_loss += loss * (1.0 / i) * loss_downgrade #TODO: check whether we need * 0.01 (grad clif) for handling large errors
-    
+        scaled_loss = loss * weight * loss_downgrade #TODO: check whether we need * 0.01 (grad clif) for handling large errors
+
+        if torch.isnan(scaled_loss):
+            print(f"Warning: NaN detected in frame {i}")
+            print(f"diff stats - min: {diff.min()}, max: {diff.max()}, mean: {diff.mean()}")
+            continue
+
+        total_loss += scaled_loss
+
     return total_loss / window_size
 
 def pose_smoothness_loss(body_pose, window_size=3):
@@ -503,7 +541,7 @@ def angle_magnitude_prior(body_pose):
     return excess.mean()
 
 @torch.no_grad()
-def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1):
+def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1, use_temporal_smoothness=False):
     camera = dict(np.load(f"{root}/cameras.npz"))
     if downscale > 1:
         camera["intrinsic"][:2] /= downscale
@@ -573,6 +611,11 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
         keypoint_weights = torch.ones_like(keypoints_2d[..., 0])
         keypoint_weights[..., HEAD_KEYPOINT_INDICES] = 0.01  # Reduce influence of head keypoints
         
+        # Calculate raw error before normalization
+        raw_diff = keypoints_2d[..., :2] - keypoints_pred
+        raw_error = raw_diff.abs().sum(-1)
+        print(f"Raw error stats - min: {raw_error.min():.6f}, max: {raw_error.max():.6f}, mean: {raw_error.mean():.6f}")
+        
         # 1. Input normalization
         keypoints_norm = keypoints_2d[..., :2] / torch.tensor([W, H], device=DEVICE)
         keypoints_pred_norm = keypoints_pred / torch.tensor([W, H], device=DEVICE)
@@ -580,6 +623,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
         # 2. Calculate difference and its magnitude
         diff = keypoints_norm - keypoints_pred_norm
         diff_norm = diff.abs().sum(-1)  # L1 norm of difference
+        print(f"Normalized error stats - min: {diff_norm.min():.6f}, max: {diff_norm.max():.6f}, mean: {diff_norm.mean():.6f}")
         
         # Huber loss with correct dimensions
         error = torch.where(
@@ -588,7 +632,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             diff_norm - 0.5
         )
         
-        print(f"Error stats - min: {error.min():.3f}, max: {error.max():.3f}, mean: {error.mean():.3f}")
+        print(f"Error stats - min: {error.min():.6f}, max: {error.max():.6f}, mean: {error.mean():.6f}")
         
         # Apply confidence mask
         mask = (keypoints_2d[..., 2] > keypoints_threshold)
@@ -597,18 +641,25 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
         
         # 3. Log-space loss for better numerical stability
         loss = torch.log1p(error[:, SELECT_JOINTS]).mean()
-        
-        # 4. Temporal smoothness with L1 norm # TODO: update temporal_smoothness_loss(smpl_output.vertices) with L1 norm to # Enhanced temporal smoothness
-        loss_downgrade = 0.01 # TODO: was 0.01 check whether it's needed?
-        smoothness_loss = temporal_smoothness_loss(smpl_output.vertices, window_size=3, loss_downgrade=loss_downgrade)
-        pose_smoothness = pose_smoothness_loss(params['body_pose'])
         pose_prior = pose_prior_loss(params['body_pose'])
 
-        # Combine losses with weights
-        total_loss = loss + 0.05 * smoothness_loss + 0.01 * pose_smoothness + 0.1 * pose_prior
-        
-        print(f"Keypoint loss: {loss.item():.3f}, Smoothness loss: {smoothness_loss.item():.3f}, Pose smoothness: {pose_smoothness.item():.3f}")
-        
+        # Only add temporal smoothness if enabled
+        if use_temporal_smoothness:
+            loss_downgrade = 0.1 # TODO: was 0.01 check whether it's needed?
+            smoothness_loss = temporal_smoothness_loss(smpl_output.vertices, window_size=3, loss_downgrade=loss_downgrade)
+            pose_smoothness = pose_smoothness_loss(params['body_pose'])
+
+            total_loss = 0.84 * loss + 0.05 * smoothness_loss + 0.01 * pose_smoothness + 0.1 * pose_prior
+            print(f"Total loss: {total_loss.item():.6f}: Keypoint loss: {loss.item():.6f}, "
+                  f"Smoothness loss: {smoothness_loss.item():.6f}, "
+                  f"Pose smoothness: {pose_smoothness.item():.6f}, "
+                  f"Pose prior: {pose_prior.item():.6f}")
+            
+        else:
+            total_loss = 0.9 * loss + 0.1 * pose_prior
+            print(f"Total loss: {total_loss.item():.6f}: Keypoint loss: {loss.item():.6f}, "
+                  f"Pose prior: {pose_prior.item():.6f}")
+
         if torch.isnan(total_loss):
             print("WARNING: NaN loss detected!")
             raise ValueError("NaN loss detected!")
@@ -618,7 +669,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
         
         # 5. Gradient clipping with a smaller norm
         torch.nn.utils.clip_grad_norm_(params.values(), max_norm=0.1)
-        
+
         return total_loss
     
     optimize(optimizer, closure, max_iter=200)
@@ -677,19 +728,23 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             debug_dir = os.path.join(root, "refine-smpl", "debug")
             os.makedirs(debug_dir, exist_ok=True)
 
-        for i in range(len(masks)):
-            mask = torch.from_numpy(masks[i:i+1]).float().to(DEVICE) / 255
+        # Process frames in small batches to improve speed while maintaining memory efficiency
+        BATCH_SIZE = 4  # Conservative batch size, increase if memory allows
+        for i in range(0, len(masks), BATCH_SIZE):
+            batch_end = min(i + BATCH_SIZE, len(masks))
+            batch_masks = torch.from_numpy(masks[i:batch_end]).float().to(DEVICE) / 255
             
-            optimizer = torch.optim.LBFGS(params.values(), line_search_fn="strong_wolfe")
+            optimizer = torch.optim.Adam(params.values(), lr=1e-3)
+            
             def closure():
                 optimizer.zero_grad()
 
-                # Get SMPL output
+                # Get SMPL output for batch
                 smpl_output = body_model(
                     betas=params["betas"].clone().detach(),
-                    global_orient=params["global_orient"][i:i+1],
-                    body_pose=params["body_pose"][i:i+1],
-                    transl=params["transl"][i:i+1],
+                    global_orient=params["global_orient"][i:batch_end],
+                    body_pose=params["body_pose"][i:batch_end],
+                    transl=params["transl"][i:batch_end],
                 )
 
                 # Create headless mesh
@@ -697,80 +752,84 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
 
                 # Create meshes for both full body and headless
                 meshes_full = Meshes(
-                    verts=smpl_output.vertices,
-                    faces=body_model.faces_tensor[None].repeat(1, 1, 1),
+                    verts=smpl_output.vertices.float(),  # Ensure float32
+                    faces=body_model.faces_tensor[None].repeat(batch_end - i, 1, 1),
                 ).to(DEVICE)
 
                 meshes_no_head = Meshes(
-                    verts=vertices_no_head,
+                    verts=vertices_no_head.float(),  # Ensure float32
                     faces=faces_no_head,
                 ).to(DEVICE)
 
-                # Render both silhouettes
                 silhouette_full = renderer(meshes_full)[..., 3]
                 silhouette_no_head = renderer(meshes_no_head)[..., 3]
 
-                # Compare both silhouettes with the mask
-                loss_silhouette_full = F.mse_loss(mask, silhouette_full)
-                loss_silhouette_no_head = F.mse_loss(mask, silhouette_no_head)
+                # Fix: Ensure batch dimensions match
+                if silhouette_full.shape[0] != batch_masks.shape[0]:
+                    batch_masks = batch_masks.expand(silhouette_full.shape[0], -1, -1)
 
-                # Save debug images after losses are calculated
-                if silhouette_debug and i % 10 == 0:  # Save every 10th frame
-                    # Convert tensors to numpy for visualization
-                    sil_full = silhouette_full.detach().cpu().numpy()[0]
-                    sil_no_head = silhouette_no_head.detach().cpu().numpy()[0]
-                    mask_np = mask.detach().cpu().numpy()[0]
-                    
-                    # Create difference images
-                    diff_full = np.abs(sil_full - mask_np)
-                    diff_no_head = np.abs(sil_no_head - mask_np)
-                    
-                    # Create visualization grid
-                    plt.figure(figsize=(20, 10))
-                    
-                    plt.subplot(231)
-                    plt.imshow(mask_np)
-                    plt.title('Target Mask')
-                    plt.axis('off')
-                    
-                    plt.subplot(232)
-                    plt.imshow(sil_full)
-                    plt.title('Full Silhouette')
-                    plt.axis('off')
-                    
-                    plt.subplot(233)
-                    plt.imshow(sil_no_head)
-                    plt.title('No-Head Silhouette')
-                    plt.axis('off')
-                    
-                    plt.subplot(235)
-                    plt.imshow(diff_full, cmap='hot')
-                    plt.title('Full Difference')
-                    plt.colorbar()
-                    plt.axis('off')
-                    
-                    plt.subplot(236)
-                    plt.imshow(diff_no_head, cmap='hot')
-                    plt.title('No-Head Difference')
-                    plt.colorbar()
-                    plt.axis('off')
-                    
-                    plt.suptitle(f'Frame {i} - Loss Full: {loss_silhouette_full:.4f}, Loss No-Head: {loss_silhouette_no_head:.4f}')
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(debug_dir, f'silhouette_comparison_{i:04d}.png'))
-                    plt.close()
+                # Compare both silhouettes with the mask
+                loss_silhouette_full = F.mse_loss(batch_masks, silhouette_full)
+                loss_silhouette_no_head = F.mse_loss(batch_masks, silhouette_no_head)
+
+                # Debug visualization with reduced frequency
+                if silhouette_debug and i % 20 == 0:  # Reduced from every 10th to every 20th frame
+                    with torch.no_grad():
+                        # Convert tensors to numpy for visualization
+                        sil_full = silhouette_full.detach().cpu().numpy()[0]
+                        sil_no_head = silhouette_no_head.detach().cpu().numpy()[0]
+                        mask_np = batch_masks.detach().cpu().numpy()[0]
+                        
+                        # Create difference images
+                        diff_full = np.abs(sil_full - mask_np)
+                        diff_no_head = np.abs(sil_no_head - mask_np)
+                        
+                        # Create visualization grid
+                        plt.figure(figsize=(20, 10))
+                        
+                        plt.subplot(231)
+                        plt.imshow(mask_np)
+                        plt.title('Target Mask')
+                        plt.axis('off')
+                        
+                        plt.subplot(232)
+                        plt.imshow(sil_full)
+                        plt.title('Full Silhouette')
+                        plt.axis('off')
+                        
+                        plt.subplot(233)
+                        plt.imshow(sil_no_head)
+                        plt.title('No-Head Silhouette')
+                        plt.axis('off')
+                        
+                        plt.subplot(235)
+                        plt.imshow(diff_full, cmap='hot')
+                        plt.title('Full Difference')
+                        plt.colorbar()
+                        plt.axis('off')
+                        
+                        plt.subplot(236)
+                        plt.imshow(diff_no_head, cmap='hot')
+                        plt.title('No-Head Difference')
+                        plt.colorbar()
+                        plt.axis('off')
+                        
+                        plt.suptitle(f'Frame {i} - Loss Full: {loss_silhouette_full:.4f}, Loss No-Head: {loss_silhouette_no_head:.4f}')
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(debug_dir, f'silhouette_comparison_{i:04d}.png'))
+                        plt.close()
 
                 # Use the better matching silhouette
                 loss_silhouette = torch.minimum(loss_silhouette_full, loss_silhouette_no_head)
 
                 # Rest of the loss computation
                 keypoints_pred = project(projection_matrices, joint_mapper(smpl_output))
-                loss_keypoints = (keypoints_2d[i:i+1, :, :2] - keypoints_pred).square().sum(-1).sqrt()
+                loss_keypoints = (keypoints_2d[i:batch_end, :, :2] - keypoints_pred).square().sum(-1).sqrt()
                 
-                m1 = (keypoints_2d[i:i+1, :, 2] > 0)
+                m1 = (keypoints_2d[i:batch_end, :, 2] > 0)
                 loss_keypoints = (loss_keypoints * m1.float()).mean()
 
-                anatomical_loss = anatomical_pose_prior(params['body_pose'][i:i+1])
+                anatomical_loss = anatomical_pose_prior(params['body_pose'][i:batch_end])
                 magnitude_prior = angle_magnitude_prior(params['body_pose'])
                 
                 loss = (0.1 * loss_silhouette 
@@ -800,7 +859,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
     
     np.savez(f"{root}/poses_optimized.npz", **smpl_params)
 
-if __name__ == "__main__":
+def parse_args():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
@@ -808,5 +867,15 @@ if __name__ == "__main__":
     parser.add_argument("--keypoints-threshold", type=float, default=0.2)
     parser.add_argument("--silhouette", action="store_true")
     parser.add_argument("--downscale", type=float, default=1.0)
-    args = parser.parse_args()
-    main(args.data_dir, args.keypoints_threshold, args.silhouette, args.gender, args.downscale)
+    parser.add_argument('--use_temporal_smoothness', action='store_true', 
+                      help='Enable temporal smoothness loss')
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args.data_dir, 
+         args.keypoints_threshold, 
+         args.silhouette, 
+         args.gender, 
+         args.downscale,
+         args.use_temporal_smoothness)
