@@ -78,6 +78,10 @@ if [ ! -d "$VIDEO_FOLDER/$MASK_FOLDER" ] || [ "$FORCE_RERUN" = true ]; then
     --data_dir $VIDEO_FOLDER \
     --image_folder $PREPROCESSED_IMAGE_FOLDER
   # python scripts/custom/run-rvm.py --data_dir $VIDEO_FOLDER
+
+  # detect head segmentation with SCHP
+  python scripts/custom/run-schp.py --data_dir $VIDEO_FOLDER --image_folder $PREPROCESSED_IMAGE_FOLDER
+
   python scripts/custom/extract-largest-connected-components.py \
     --data_dir $VIDEO_FOLDER \
     --image_folder $PREPROCESSED_IMAGE_FOLDER \

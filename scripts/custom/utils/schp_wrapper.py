@@ -49,7 +49,7 @@ HEAD_LABELS_BY_MODEL = {
     ModelType.PASCAL: {'Head'}               # From README.md line 46
 }
 
-def setup_schp(model_type: ModelType):
+def setup_schp(model_type: ModelType, output_dir: Path):
     """Initialize SCHP model with specified dataset weights"""
     model_path = SCHP_PATH / "pretrained_models" / MODEL_PATHS[model_type]
     
@@ -59,7 +59,7 @@ def setup_schp(model_type: ModelType):
         )
     
     input_dir = "data/custom/e1/raw_images"
-    output_dir = f"data/custom/e1/test_schp/{model_type.value}/parsing_results"
+    output_dir = output_dir / f"{model_type.value}/parsing_results"
     os.makedirs(output_dir, exist_ok=True)
     
     cmd = [
@@ -172,7 +172,7 @@ def main():
     model_type = ModelType.PASCAL  # Change this to use different models
     
     output_dir = Path(f"data/custom/e1/test_schp/{model_type.value}")
-    parsing_dir = setup_schp(model_type)
+    parsing_dir = setup_schp(model_type, output_dir)
     head_masks_dir = output_dir / "head_masks"
     debug_dir = output_dir / "debug"
     
