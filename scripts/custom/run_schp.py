@@ -23,9 +23,12 @@ def create_body_only_masks(sam_masks_dir, head_masks_dir, body_only_masks_dir):
             print(f"Warning: Head mask not found for {mask_file}")
             continue
         
-        # Create body-only mask by subtracting head mask from SAM mask
+        # Improve head mask coverage using morphological operations
+        improved_head_mask = improve_head_masks(head_mask)
+        
+        # Create body-only mask by subtracting improved head mask from SAM mask
         body_only_mask = sam_mask.copy()
-        body_only_mask[head_mask > 127] = 0
+        body_only_mask[improved_head_mask > 127] = 0
         
         # Save body-only mask
         cv2.imwrite(os.path.join(body_only_masks_dir, mask_file), body_only_mask)
@@ -53,6 +56,23 @@ def create_masked_images(image_dir, mask_dir, output_dir):
         
         # Save masked image
         cv2.imwrite(os.path.join(output_dir, image_file), masked_image)
+
+def improve_head_masks(head_mask):
+    """Apply morphological operations to improve head mask coverage"""
+    # Create elliptical kernels for more natural head shape operations
+    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel_smooth = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    
+    # 1. Initial dilation to catch thin edges of hair and chin
+    dilated_mask = cv2.dilate(head_mask, kernel_dilate, iterations=2)
+    
+    # 2. Smooth the edges
+    smoothed_mask = cv2.morphologyEx(dilated_mask, cv2.MORPH_CLOSE, kernel_smooth)
+    
+    # 3. Final slight dilation to ensure coverage
+    final_mask = cv2.dilate(smoothed_mask, kernel_smooth, iterations=1)
+    
+    return final_mask
 
 def main():
     parser = argparse.ArgumentParser()
