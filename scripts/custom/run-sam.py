@@ -10,21 +10,187 @@ from collections import deque
 from skimage import feature, morphology
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from scripts.custom.utils.sam_utils import HeadPointEstimator, KEYPOINT_INDICES
-from scripts.custom.utils.face_detector import FaceDetector
-from scripts.custom.utils.head_segmentation import HairSegmenter
-from scripts.custom.utils.temporal_tracker import HeadTracker
-from scripts.custom.utils.detection_combiner import combine_detections, validate_combined_detection
+from scripts.custom.utils.sam_utils import KEYPOINT_INDICES
+
+# Only import head-related modules if needed
+def import_head_modules():
+    from scripts.custom.utils.sam_utils import HeadPointEstimator
+    from scripts.custom.utils.face_detector import FaceDetector
+    from scripts.custom.utils.head_segmentation import HairSegmenter
+    from scripts.custom.utils.temporal_tracker import HeadTracker
+    from scripts.custom.utils.detection_combiner import combine_detections, validate_combined_detection
+    
+    def filter_mask_by_bbox(mask, bbox):
+        """Filter mask by bounding box"""
+        x1, y1, x2, y2 = map(int, bbox)
+        filtered_mask = np.zeros_like(mask)
+        filtered_mask[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
+        return filtered_mask
+    
+    def combine_face_hair_masks(face_mask, hair_mask):
+        """Combine face and hair masks with validation"""
+        if face_mask is None:
+            return hair_mask
+        if hair_mask is None:
+            return face_mask
+        return face_mask | hair_mask
+        
+    def validate_head_masks(masks, scores, box):
+        """Validate head masks based on size and position"""
+        if masks is None or len(masks) == 0:
+            return None, None
+            
+        best_score = -float('inf')
+        best_mask = None
+        
+        for mask, score in zip(masks, scores):
+            # Basic validation checks
+            if score < 0.5:  # Confidence threshold
+                continue
+                
+            # Get mask properties
+            mask_area = np.sum(mask)
+            if mask_area < 100:  # Minimum area threshold
+                continue
+                
+            if score > best_score:
+                best_score = score
+                best_mask = mask
+                
+        return best_mask, best_score
+    
+    def create_head_mask(keypoints, box, predictor, masked_image, frame_idx, 
+                        face_detector, hair_segmenter, head_tracker):
+        """Create head mask using multiple detection strategies and temporal smoothing"""
+        try:
+            print(f"\nHead Detection Debug (Frame {frame_idx}):")
+            
+            # 1. Get keypoint-based head bbox
+            estimator = HeadPointEstimator(keypoints, box)
+            head_points, original_indices, background_points = estimator.get_head_points()
+            final_bbox, neck_info = estimator.get_head_bbox()
+            keypoint_conf = estimator.get_confidence() if final_bbox is not None else 0.0
+            print(f"Keypoint detection - Confidence: {keypoint_conf:.3f}")
+            
+            # 2. Get face detection bbox with proper error handling
+            try:
+                face_bbox, face_conf, face_debug = face_detector.get_head_bbox(
+                    masked_image, 
+                    final_bbox
+                )
+            except ValueError:
+                print("Face detection returned invalid format")
+                face_bbox, face_conf, face_debug = None, 0.0, {'error': 'Invalid return format'}
+            
+            prev_bbox, prev_conf = None, 0.0
+            # # 3. Get previous detection from tracker
+            # prev_bbox, prev_conf = head_tracker.get_last_detection()
+            # if prev_bbox is not None:
+            #     print(f"Previous detection - Confidence: {prev_conf:.3f}")
+            # else:
+            #     print("No previous detection found")
+            
+            # 4. Combine detections with confidence weighting
+            final_bbox, confidence, combiner_debug = combine_detections(
+                final_bbox, keypoint_conf,
+                face_bbox, face_conf,
+                prev_bbox, prev_conf
+            )
+            print(f"Combined detection - Confidence: {confidence:.3f}")
+            
+            # 5. Validate combined detection
+            final_bbox, confidence = validate_combined_detection(
+                final_bbox, confidence, masked_image.shape
+            )
+            print(f"Validated detection - Confidence: {confidence:.3f}")
+            if final_bbox is None:
+                print("No valid head detection")
+                return None, None, None, None, {'error': 'No valid head detection'}
+                
+            # 6. Get initial face mask from SAM
+            masks, scores, _ = predictor.predict(
+                point_coords=head_points,
+                point_labels=np.ones(len(head_points)),
+                box=final_bbox,
+                multimask_output=True
+            )
+            
+            if masks is None or len(masks) == 0:
+                print("SAM prediction failed")
+                return None, None, None, None, {'error': 'SAM prediction failed'}
+                
+            face_mask = masks[np.argmax(scores)]
+            
+            # 7. Get hair mask with validation
+            hair_result = hair_segmenter.get_validated_hair_mask(
+                masked_image, face_mask, final_bbox, confidence
+            )
+            hair_mask = None
+            hair_debug = {}
+            if hair_result is not None:
+                hair_mask, hair_debug = hair_result
+            
+            # 8. Combine face and hair masks
+            head_mask = face_mask.copy()
+            if hair_mask is not None:
+                head_mask |= hair_mask
+                
+            # 9. Update temporal tracker
+            head_tracker.update(final_bbox, head_mask, confidence)
+            
+            # 10. Get smoothed prediction
+            smooth_bbox, smooth_mask, smooth_conf, tracker_debug = head_tracker.get_smooth_prediction()
+            
+            # Collect all debug data
+            debug_data = {
+                'face_detector': face_debug,
+                'detection_combiner': combiner_debug,
+                'hair_segmentation': hair_debug,
+                'temporal_tracker': tracker_debug,
+                'sam_predictions': {
+                    'masks': masks,
+                    'scores': scores,
+                    'selected_mask': face_mask
+                },
+                'final_results': {
+                    'mask': smooth_mask if smooth_mask is not None else head_mask,
+                    'bbox': smooth_bbox if smooth_bbox is not None else final_bbox,
+                    'confidence': smooth_conf if smooth_conf is not None else confidence
+                }
+            }
+            
+            if smooth_mask is not None:
+                print(f"Using smoothed prediction (conf: {smooth_conf:.3f})")
+                return smooth_mask, (head_points, original_indices), smooth_bbox, neck_info, debug_data
+                
+            print(f"Using current prediction (conf: {confidence:.3f})")
+            return head_mask, (head_points, original_indices), final_bbox, neck_info, debug_data
+            
+        except Exception as e:
+            print(f"Error in create_head_mask: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None, None, None, {'error': str(e)}
+    
+    return (HeadPointEstimator, FaceDetector, HairSegmenter, HeadTracker, 
+            combine_detections, validate_combined_detection, create_head_mask,
+            filter_mask_by_bbox, combine_face_hair_masks, validate_head_masks)
+
+# Import head modules only when head segmentation is enabled
+head_modules = None
 
 CHECKPOINT = os.path.expanduser("./third_parties/segment-anything/ckpts/sam_vit_h_4b8939.pth")
 MODEL = "vit_h"
 
 class MaskGenerator:
-    def __init__(self, predictor):
+    def __init__(self, predictor, skip_head=True):
         self.predictor = predictor
-        self.face_detector = FaceDetector()
-        self.hair_segmenter = HairSegmenter()
-        self.head_tracker = HeadTracker()
+        self.skip_head = skip_head
+        if not skip_head and head_modules is not None:  # Add head_modules check
+            _, FaceDetector, HairSegmenter, HeadTracker, *_ = head_modules
+            self.face_detector = FaceDetector()
+            self.hair_segmenter = HairSegmenter()
+            self.head_tracker = HeadTracker()
         self.frame_idx = 0
     
     def process_single_frame(self, img, pts, human_boxes):
@@ -58,23 +224,28 @@ class MaskGenerator:
                 largest_area = area
                 best_mask = person_mask
                 
-                head_result = create_head_mask(
-                    keypoints=full_keypoints,
-                    box=box,
-                    predictor=self.predictor,
-                    masked_image=img,
-                    frame_idx=self.frame_idx,
-                    face_detector=self.face_detector,
-                    hair_segmenter=self.hair_segmenter,
-                    head_tracker=self.head_tracker
-                )
-                print(f"\nHead result: {head_result}")
-                if head_result is not None:
-                    best_head_mask, head_points, head_bbox, neck_info, frame_debug = head_result
-                    debug_data.update(frame_debug)
+                if not self.skip_head and head_modules is not None:  # Add head_modules check
+                    _, _, _, _, _, _, create_head_mask = head_modules  # Get create_head_mask
+                    head_result = create_head_mask(
+                        keypoints=full_keypoints,
+                        box=box,
+                        predictor=self.predictor,
+                        masked_image=img,
+                        frame_idx=self.frame_idx,
+                        face_detector=self.face_detector,
+                        hair_segmenter=self.hair_segmenter,
+                        head_tracker=self.head_tracker
+                    )
+                    print(f"\nHead result: {head_result}")
+                    if head_result is not None:
+                        best_head_mask, head_points, head_bbox, neck_info, frame_debug = head_result
+                        debug_data.update(frame_debug)
         
         self.frame_idx += 1
-        return best_mask, best_head_mask, head_points, head_bbox, neck_info, debug_data
+        if self.skip_head:
+            return best_mask, None, None, None, None, {}  # Match return signature when head segmentation is disabled
+        else:
+            return best_mask, best_head_mask, head_points, head_bbox, neck_info, debug_data
     
     def get_person_mask(self, box_pts, box):
         """Generate full person mask using SAM"""
@@ -168,119 +339,6 @@ def filter_mask_by_bbox(mask, bbox):
     print(f"Final mask: kept {len(valid_components)} of {num_features} components")
     return filtered_mask
 
-def create_head_mask(keypoints, box, predictor, masked_image, frame_idx, 
-                    face_detector, hair_segmenter, head_tracker):
-    """Create head mask using multiple detection strategies and temporal smoothing"""
-    try:
-        print(f"\nHead Detection Debug (Frame {frame_idx}):")
-        
-        # 1. Get keypoint-based head bbox
-        estimator = HeadPointEstimator(keypoints, box)
-        head_points, original_indices, background_points = estimator.get_head_points()
-        final_bbox, neck_info = estimator.get_head_bbox()
-        keypoint_conf = estimator.get_confidence() if final_bbox is not None else 0.0
-        print(f"Keypoint detection - Confidence: {keypoint_conf:.3f}")
-        
-        # 2. Get face detection bbox with proper error handling
-        try:
-            face_bbox, face_conf, face_debug = face_detector.get_head_bbox(
-                masked_image, 
-                final_bbox
-            )
-        except ValueError:
-            print("Face detection returned invalid format")
-            face_bbox, face_conf, face_debug = None, 0.0, {'error': 'Invalid return format'}
-        
-        prev_bbox, prev_conf = None, 0.0
-        # # 3. Get previous detection from tracker
-        # prev_bbox, prev_conf = head_tracker.get_last_detection()
-        # if prev_bbox is not None:
-        #     print(f"Previous detection - Confidence: {prev_conf:.3f}")
-        # else:
-        #     print("No previous detection found")
-        
-        # 4. Combine detections with confidence weighting
-        final_bbox, confidence, combiner_debug = combine_detections(
-            final_bbox, keypoint_conf,
-            face_bbox, face_conf,
-            prev_bbox, prev_conf
-        )
-        print(f"Combined detection - Confidence: {confidence:.3f}")
-        
-        # 5. Validate combined detection
-        final_bbox, confidence = validate_combined_detection(
-            final_bbox, confidence, masked_image.shape
-        )
-        print(f"Validated detection - Confidence: {confidence:.3f}")
-        if final_bbox is None:
-            print("No valid head detection")
-            return None, None, None, None, {'error': 'No valid head detection'}
-            
-        # 6. Get initial face mask from SAM
-        masks, scores, _ = predictor.predict(
-            point_coords=head_points,
-            point_labels=np.ones(len(head_points)),
-            box=final_bbox,
-            multimask_output=True
-        )
-        
-        if masks is None or len(masks) == 0:
-            print("SAM prediction failed")
-            return None, None, None, None, {'error': 'SAM prediction failed'}
-            
-        face_mask = masks[np.argmax(scores)]
-        
-        # 7. Get hair mask with validation
-        hair_result = hair_segmenter.get_validated_hair_mask(
-            masked_image, face_mask, final_bbox, confidence
-        )
-        hair_mask = None
-        hair_debug = {}
-        if hair_result is not None:
-            hair_mask, hair_debug = hair_result
-        
-        # 8. Combine face and hair masks
-        head_mask = face_mask.copy()
-        if hair_mask is not None:
-            head_mask |= hair_mask
-            
-        # 9. Update temporal tracker
-        head_tracker.update(final_bbox, head_mask, confidence)
-        
-        # 10. Get smoothed prediction
-        smooth_bbox, smooth_mask, smooth_conf, tracker_debug = head_tracker.get_smooth_prediction()
-        
-        # Collect all debug data
-        debug_data = {
-            'face_detector': face_debug,
-            'detection_combiner': combiner_debug,
-            'hair_segmentation': hair_debug,
-            'temporal_tracker': tracker_debug,
-            'sam_predictions': {
-                'masks': masks,
-                'scores': scores,
-                'selected_mask': face_mask
-            },
-            'final_results': {
-                'mask': smooth_mask if smooth_mask is not None else head_mask,
-                'bbox': smooth_bbox if smooth_bbox is not None else final_bbox,
-                'confidence': smooth_conf if smooth_conf is not None else confidence
-            }
-        }
-        
-        if smooth_mask is not None:
-            print(f"Using smoothed prediction (conf: {smooth_conf:.3f})")
-            return smooth_mask, (head_points, original_indices), smooth_bbox, neck_info, debug_data
-            
-        print(f"Using current prediction (conf: {confidence:.3f})")
-        return head_mask, (head_points, original_indices), final_bbox, neck_info, debug_data
-        
-    except Exception as e:
-        print(f"Error in create_head_mask: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None, None, None, {'error': str(e)}
-
 def combine_face_hair_masks(face_mask, hair_mask):
     """Combine face and hair masks with validation"""
     if hair_mask is None:
@@ -344,7 +402,7 @@ def validate_head_masks(masks, scores, box):
             
     return valid_masks, valid_scores
 
-def save_masks_and_visualizations(img, fn, output_root, best_mask, best_head_mask=None, head_points=None, head_bbox=None, neck_info=None, full_keypoints=None):  # Add full_keypoints parameter
+def save_masks_and_visualizations(img, fn, output_root, best_mask, head_segmentation=False, best_head_mask=None, head_points=None, head_bbox=None, neck_info=None, full_keypoints=None):
     """Save all masks and visualizations"""
     if best_mask is None:
         return
@@ -353,53 +411,52 @@ def save_masks_and_visualizations(img, fn, output_root, best_mask, best_head_mas
     cv2.imwrite(os.path.join(output_root, "masks_sam", os.path.basename(fn)), 
                 best_mask.astype(np.uint8) * 255)
     
-    # Create and save body-only mask (excluding head only)
-    body_only_mask = best_mask.copy()
-    if best_head_mask is not None:
-        body_only_mask[best_head_mask] = 0  # Remove head region
-    
-    cv2.imwrite(os.path.join(output_root, "masks_body_only", os.path.basename(fn)), 
-                body_only_mask.astype(np.uint8) * 255)
-    
     # Save visualizations
     full_vis = img.copy()
     full_vis[~best_mask] = 0
     cv2.imwrite(os.path.join(output_root, "masks_sam_images", os.path.basename(fn)), 
                 full_vis)
-    
-    body_vis = img.copy()
-    body_vis[~body_only_mask] = 0
-    cv2.imwrite(os.path.join(output_root, "masks_body_only_images", os.path.basename(fn)), 
-                body_vis)
-    
-    print(f"\nNeck info: {neck_info}")
-    # Debug visualization for head mask only
-    if best_head_mask is not None:
+        
+    # Create and save body-only mask (excluding head only if head segmentation is enabled)
+    if head_segmentation and best_head_mask is not None:
+        body_only_mask = best_mask.copy()
+        body_only_mask[best_head_mask] = 0  # Remove head region
+        cv2.imwrite(os.path.join(output_root, "masks_body_only", os.path.basename(fn)), 
+                    body_only_mask.astype(np.uint8) * 255)
+        
+        # Save body-only visualization
+        body_vis = img.copy()
+        body_vis[~body_only_mask] = 0
+        cv2.imwrite(os.path.join(output_root, "masks_body_only_images", os.path.basename(fn)), 
+                    body_vis)
+
+        # Debug visualization for head mask only
         debug_vis = create_debug_visualization(
             img, 
+            full_keypoints,
+            head_segmentation,
             best_head_mask, 
             head_points,
-            neck_info,
-            full_keypoints  # Pass full keypoints to visualization
+            neck_info
         )
         cv2.imwrite(os.path.join(output_root, "debug_head_masks", os.path.basename(fn)), 
-                   debug_vis)
-    
-    # Save head bbox crop if available
-    if head_bbox is not None:
-        # Ensure coordinates are within image bounds
-        x1 = max(0, int(head_bbox[0]))
-        y1 = max(0, int(head_bbox[1]))
-        x2 = min(img.shape[1], int(head_bbox[2]))
-        y2 = min(img.shape[0], int(head_bbox[3]))
+                    debug_vis)
         
-        # Crop and save the head bbox region
-        head_bbox_crop = img[y1:y2, x1:x2].copy()
-        head_bbox_path = os.path.join(output_root, "head_bbox_crops", os.path.basename(fn))
-        os.makedirs(os.path.dirname(head_bbox_path), exist_ok=True)
-        cv2.imwrite(head_bbox_path, head_bbox_crop)
+        # Save head bbox crop if available
+        if head_bbox is not None:
+            # Ensure coordinates are within image bounds
+            x1 = max(0, int(head_bbox[0]))
+            y1 = max(0, int(head_bbox[1]))
+            x2 = min(img.shape[1], int(head_bbox[2]))
+            y2 = min(img.shape[0], int(head_bbox[3]))
+            
+            # Crop and save the head bbox region
+            head_bbox_crop = img[y1:y2, x1:x2].copy()
+            head_bbox_path = os.path.join(output_root, "head_bbox_crops", os.path.basename(fn))
+            os.makedirs(os.path.dirname(head_bbox_path), exist_ok=True)
+            cv2.imwrite(head_bbox_path, head_bbox_crop)
 
-def create_debug_visualization(img, head_mask=None, head_points_data=None, neck_info=None, full_keypoints=None):
+def create_debug_visualization(img, full_keypoints=None, head_segmentation=False, head_mask=None, head_points_data=None, neck_info=None):
     """Create debug visualization with head mask, points, and neck point"""
     debug_vis = img.copy()
     
@@ -426,35 +483,37 @@ def create_debug_visualization(img, head_mask=None, head_points_data=None, neck_
                               1)
                     print(f"Drew {name} at ({point[0]:.1f}, {point[1]:.1f}) conf: {point[2]:.2f}")
     
-    # Draw head points if available
-    if head_points_data is not None:
-        head_points, point_indices = head_points_data
-        for i, (point, idx) in enumerate(zip(head_points, point_indices)):
-            # Red for original keypoints, blue for estimated points
-            color = (0, 0, 255) if idx is not None else (255, 0, 0)
-            cv2.circle(debug_vis, 
-                      (int(point[0]), int(point[1])), 
-                      3, color, -1)
-    
-    # Draw neck point if available
-    print(f"\nNeck info: {neck_info}")
-    if neck_info is not None:
-        neck_point, is_detected = neck_info
-        print(f"Neck point: {neck_point}, Detected: {is_detected}")
-        # Green for detected neck, yellow for estimated neck
-        color = (0, 255, 0) if is_detected else (0, 255, 255)
-        cv2.circle(debug_vis,
-                  (int(neck_point[0]), int(neck_point[1])),
-                  5, color, -1)  # Larger circle for neck point
-        label = "Detected Neck" if is_detected else "Estimated Neck"
-        cv2.putText(debug_vis,
-                   label,
-                   (int(neck_point[0]), int(neck_point[1] - 10)),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-    
-    # Overlay head mask in blue
-    if head_mask is not None:
-        debug_vis[head_mask] = debug_vis[head_mask] * 0.5 + np.array([255, 0, 0]) * 0.5
+    # Only draw head-related visualizations if head segmentation is enabled
+    if head_segmentation:
+        # Draw head points if available
+        if head_points_data is not None:
+            head_points, point_indices = head_points_data
+            for i, (point, idx) in enumerate(zip(head_points, point_indices)):
+                # Red for original keypoints, blue for estimated points
+                color = (0, 0, 255) if idx is not None else (255, 0, 0)
+                cv2.circle(debug_vis, 
+                          (int(point[0]), int(point[1])), 
+                          3, color, -1)
+        
+        # Draw neck point if available
+        if neck_info is not None:
+            print(f"\nNeck info: {neck_info}")
+            neck_point, is_detected = neck_info
+            print(f"Neck point: {neck_point}, Detected: {is_detected}")
+            # Green for detected neck, yellow for estimated neck
+            color = (0, 255, 0) if is_detected else (0, 255, 255)
+            cv2.circle(debug_vis,
+                      (int(neck_point[0]), int(neck_point[1])),
+                      5, color, -1)  # Larger circle for neck point
+            label = "Detected Neck" if is_detected else "Estimated Neck"
+            cv2.putText(debug_vis,
+                       label,
+                       (int(neck_point[0]), int(neck_point[1] - 10)),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        
+        # Overlay head mask in blue
+        if head_mask is not None:
+            debug_vis[head_mask] = debug_vis[head_mask] * 0.5 + np.array([255, 0, 0]) * 0.5
     
     return debug_vis
 
@@ -466,24 +525,26 @@ def parse_args():
                       help='Root directory containing the data')
     parser.add_argument('--image_folder', type=str, required=True,
                       help='Folder name containing the images (relative to data_dir)')
+    parser.add_argument('--head_segmentation', action='store_true',
+                      help='Enable head segmentation (disabled by default)')
     
     args = parser.parse_args()
     return args
 
-def save_debug_images(img, video_name, frame_idx, **debug_data):
+def save_debug_images(img, video_name, frame_idx, head_segmentation=False, **debug_data):
     """Save debug images and visualizations"""
     debug_root = os.path.join(video_name, "debug_images") 
     frame_debug_dir = os.path.join(debug_root, f"frame_{frame_idx:05d}")
     
     # Create debug directories
-    subdirs = [
-        "detection_combiner",
-        "face_detector",
-        "temporal_tracker",
-        "hair_segmentation",
-        "sam_predictions",
-        "final_results"
-    ]
+    subdirs = ["sam_predictions", "final_results"]
+    if head_segmentation:  # Only create head-related dirs if enabled
+        subdirs.extend([
+            "detection_combiner",
+            "face_detector",
+            "temporal_tracker",
+            "hair_segmentation"
+        ])
     
     for subdir in subdirs:
         os.makedirs(os.path.join(frame_debug_dir, subdir), exist_ok=True)
@@ -491,106 +552,108 @@ def save_debug_images(img, video_name, frame_idx, **debug_data):
     # Save original image
     cv2.imwrite(os.path.join(frame_debug_dir, "00_original.png"), img)
 
-    # Save detection combiner debug
-    if 'detection_combiner' in debug_data:
-        det_debug = debug_data['detection_combiner']
-        det_dir = os.path.join(frame_debug_dir, "detection_combiner")
-        
-        # Save all bboxes and their crops
-        for name, det in det_debug.items():
-            if det['bbox'] is not None:
-                bbox = det['bbox']
-                # Draw bbox on image
-                vis = img.copy()
-                cv2.rectangle(vis, 
-                            (int(bbox[0]), int(bbox[1])), 
-                            (int(bbox[2]), int(bbox[3])), 
-                            (0, 255, 0), 2)
-                cv2.putText(vis, f"{name}: {det['conf']:.2f}", 
-                           (int(bbox[0]), int(bbox[1]-5)),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                cv2.imwrite(os.path.join(det_dir, f"{name}_bbox.png"), vis)
-                
-                # Ensure valid crop coordinates
-                h, w = img.shape[:2]
-                y1 = max(0, min(h-1, int(bbox[1])))
-                y2 = max(0, min(h, int(bbox[3])))
-                x1 = max(0, min(w-1, int(bbox[0])))
-                x2 = max(0, min(w, int(bbox[2])))
-                
-                # Only save crop if dimensions are valid
-                if y2 > y1 and x2 > x1:
-                    crop = img[y1:y2, x1:x2]
-                    if crop.size > 0:  # Additional check that crop is not empty
-                        cv2.imwrite(os.path.join(det_dir, f"{name}_crop.png"), crop)
-
-    # Save face detector debug
-    if 'face_detector' in debug_data:
-        face_debug = debug_data['face_detector']
-        face_dir = os.path.join(frame_debug_dir, "face_detector")
-        
-        # Save face detections visualization
-        if face_debug['detections']:
-            face_vis = img.copy()
-            for det in face_debug['detections']:
-                bbox = det.location_data.relative_bounding_box
-                h, w = img.shape[:2]
-                x1 = int(bbox.xmin * w)
-                y1 = int(bbox.ymin * h)
-                x2 = int((bbox.xmin + bbox.width) * w)
-                y2 = int((bbox.ymin + bbox.height) * h)
-                
-                cv2.rectangle(face_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(face_vis, f"conf: {det.score[0]:.2f}", 
-                           (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                
-                # Save face crop
-                face_crop = img[y1:y2, x1:x2]
-                cv2.imwrite(os.path.join(face_dir, f"face_crop_{x1}_{y1}.png"), face_crop)
-                
-            cv2.imwrite(os.path.join(face_dir, "face_detections.png"), face_vis)
-
-    # Save temporal tracker debug
-    if 'temporal_tracker' in debug_data:
-        track_debug = debug_data['temporal_tracker']
-        track_dir = os.path.join(frame_debug_dir, "temporal_tracker")
-        
-        # Save tracking history visualization
-        if track_debug['history']:
-            track_vis = img.copy()
-            colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255)]
+    # Only process head-related debug data if head segmentation is enabled
+    if head_segmentation:
+        # Save detection combiner debug
+        if 'detection_combiner' in debug_data:
+            det_debug = debug_data['detection_combiner']
+            det_dir = os.path.join(frame_debug_dir, "detection_combiner")
             
-            for i, det in enumerate(track_debug['history'][-3:]):
-                bbox = det['bbox']
-                mask = det['mask']
-                color = colors[i % len(colors)]
-                
-                # Draw mask and bbox
-                track_vis[mask] = track_vis[mask] * 0.5 + np.array(color) * 0.5
-                cv2.rectangle(track_vis, 
-                            (int(bbox[0]), int(bbox[1])), 
-                            (int(bbox[2]), int(bbox[3])), 
-                            color, 2)
-                
-            cv2.imwrite(os.path.join(track_dir, "tracking_history.png"), track_vis)
+            # Save all bboxes and their crops
+            for name, det in det_debug.items():
+                if det['bbox'] is not None:
+                    bbox = det['bbox']
+                    # Draw bbox on image
+                    vis = img.copy()
+                    cv2.rectangle(vis, 
+                                (int(bbox[0]), int(bbox[1])), 
+                                (int(bbox[2]), int(bbox[3])), 
+                                (0, 255, 0), 2)
+                    cv2.putText(vis, f"{name}: {det['conf']:.2f}", 
+                               (int(bbox[0]), int(bbox[1]-5)),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.imwrite(os.path.join(det_dir, f"{name}_bbox.png"), vis)
+                    
+                    # Ensure valid crop coordinates
+                    h, w = img.shape[:2]
+                    y1 = max(0, min(h-1, int(bbox[1])))
+                    y2 = max(0, min(h, int(bbox[3])))
+                    x1 = max(0, min(w-1, int(bbox[0])))
+                    x2 = max(0, min(w, int(bbox[2])))
+                    
+                    # Only save crop if dimensions are valid
+                    if y2 > y1 and x2 > x1:
+                        crop = img[y1:y2, x1:x2]
+                        if crop.size > 0:  # Additional check that crop is not empty
+                            cv2.imwrite(os.path.join(det_dir, f"{name}_crop.png"), crop)
 
-    # Save hair segmentation debug
-    if 'hair_segmentation' in debug_data:
-        hair_debug = debug_data['hair_segmentation']
-        hair_dir = os.path.join(frame_debug_dir, "hair_segmentation")
-        
-        # Save intermediate results
-        for name, mask in hair_debug.items():
-            if isinstance(mask, np.ndarray):
-                # Save binary mask
-                cv2.imwrite(os.path.join(hair_dir, f"{name}_mask.png"), 
-                           mask.astype(np.uint8) * 255)
-                # Save masked image
-                masked = img.copy()
-                masked[~mask] = 0
-                cv2.imwrite(os.path.join(hair_dir, f"{name}_masked.png"), masked)
+        # Save face detector debug
+        if 'face_detector' in debug_data:
+            face_debug = debug_data['face_detector']
+            face_dir = os.path.join(frame_debug_dir, "face_detector")
+            
+            # Save face detections visualization
+            if face_debug['detections']:
+                face_vis = img.copy()
+                for det in face_debug['detections']:
+                    bbox = det.location_data.relative_bounding_box
+                    h, w = img.shape[:2]
+                    x1 = int(bbox.xmin * w)
+                    y1 = int(bbox.ymin * h)
+                    x2 = int((bbox.xmin + bbox.width) * w)
+                    y2 = int((bbox.ymin + bbox.height) * h)
+                    
+                    cv2.rectangle(face_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(face_vis, f"conf: {det.score[0]:.2f}", 
+                               (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    
+                    # Save face crop
+                    face_crop = img[y1:y2, x1:x2]
+                    cv2.imwrite(os.path.join(face_dir, f"face_crop_{x1}_{y1}.png"), face_crop)
+                    
+                cv2.imwrite(os.path.join(face_dir, "face_detections.png"), face_vis)
 
-    # Save final results
+        # Save temporal tracker debug
+        if 'temporal_tracker' in debug_data:
+            track_debug = debug_data['temporal_tracker']
+            track_dir = os.path.join(frame_debug_dir, "temporal_tracker")
+            
+            # Save tracking history visualization
+            if track_debug['history']:
+                track_vis = img.copy()
+                colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255)]
+                
+                for i, det in enumerate(track_debug['history'][-3:]):
+                    bbox = det['bbox']
+                    mask = det['mask']
+                    color = colors[i % len(colors)]
+                    
+                    # Draw mask and bbox
+                    track_vis[mask] = track_vis[mask] * 0.5 + np.array(color) * 0.5
+                    cv2.rectangle(track_vis, 
+                                (int(bbox[0]), int(bbox[1])), 
+                                (int(bbox[2]), int(bbox[3])), 
+                                color, 2)
+                    
+                cv2.imwrite(os.path.join(track_dir, "tracking_history.png"), track_vis)
+
+        # Save hair segmentation debug
+        if 'hair_segmentation' in debug_data:
+            hair_debug = debug_data['hair_segmentation']
+            hair_dir = os.path.join(frame_debug_dir, "hair_segmentation")
+            
+            # Save intermediate results
+            for name, mask in hair_debug.items():
+                if isinstance(mask, np.ndarray):
+                    # Save binary mask
+                    cv2.imwrite(os.path.join(hair_dir, f"{name}_mask.png"), 
+                               mask.astype(np.uint8) * 255)
+                    # Save masked image
+                    masked = img.copy()
+                    masked[~mask] = 0
+                    cv2.imwrite(os.path.join(hair_dir, f"{name}_masked.png"), masked)
+
+    # Always save final results
     if 'final_results' in debug_data:
         final_dir = os.path.join(frame_debug_dir, "final_results")
         final = debug_data['final_results']
@@ -606,6 +669,11 @@ def save_debug_images(img, video_name, frame_idx, **debug_data):
 def main():
     # Parse arguments
     args = parse_args()
+
+    # Import head modules only if head segmentation is enabled
+    global head_modules
+    if args.head_segmentation:
+        head_modules = import_head_modules()
     
     # Validate paths
     image_path = os.path.join(args.data_dir, args.image_folder)
@@ -616,11 +684,11 @@ def main():
     if not os.path.exists(keypoints_path):
         raise ValueError(f"Keypoints file not found: {keypoints_path}")
     
-    # Initialize SAM
+    # Initialize MaskGenerator with head_segmentation parameter
     sam = sam_model_registry[MODEL](checkpoint=CHECKPOINT)
     sam.to("cuda")
     predictor = SamPredictor(sam)
-    mask_generator = MaskGenerator(predictor)
+    mask_generator = MaskGenerator(predictor, skip_head=not args.head_segmentation)
     
     # Load data
     img_lists = sorted(glob.glob(os.path.join(image_path, "*.png")))
@@ -631,16 +699,18 @@ def main():
     if len(keypoints) != len(img_lists):
         raise ValueError(f"Number of keypoints ({len(keypoints)}) does not match number of images ({len(img_lists)})")
     
-    # Create output directories
-    subdirs = [
-        "masks_sam",
-        "masks_sam_images", 
-        "masks_body_only",
-        "masks_body_only_images",
-        "debug_head_masks",
-        "head_bbox_crops"
-    ]
+    # Create output directories (conditionally for head-related dirs)
+    subdirs = ["masks_sam", "masks_sam_images"]  # Basic directories always needed
+    if args.head_segmentation:
+        # Add head-related and body-only directories when head segmentation is enabled
+        subdirs.extend([
+            "masks_body_only",
+            "masks_body_only_images",
+            "debug_head_masks", 
+            "head_bbox_crops"
+        ])
     
+    # Create output directories
     for subdir in subdirs:
         os.makedirs(os.path.join(args.data_dir, subdir), exist_ok=True)
     
@@ -661,22 +731,36 @@ def main():
             print(f"No humans detected in {fn}")
             continue
         
-        # Generate masks
-        best_mask, best_head_mask, head_points, head_bbox, neck_info, debug_data = mask_generator.process_single_frame(
-            img, pts, human_boxes
-        )
+        # Initialize debug_data before the head segmentation check
+        debug_data = {}
         
-        print(f"\nNeck info: {neck_info}")
+        # Generate masks
+        if args.head_segmentation:
+            best_mask, best_head_mask, head_points, head_bbox, neck_info, debug_data = mask_generator.process_single_frame(
+                img, pts, human_boxes
+            )
+            print(f"\nNeck info: {neck_info}")
+        else:
+            best_mask, *_ = mask_generator.process_single_frame(
+                img, pts, human_boxes
+            )
+            best_head_mask = None
+            head_points = None
+            head_bbox = None
+            neck_info = None
+            # debug_data already initialized
+        
         # Save results and visualizations
         save_masks_and_visualizations(
             img, 
             os.path.basename(fn), 
             args.data_dir, 
-            best_mask, 
-            best_head_mask, 
-            head_points, 
-            head_bbox,
-            neck_info  # Make sure to pass neck_info here
+            best_mask=best_mask, 
+            head_segmentation=args.head_segmentation,
+            best_head_mask=best_head_mask, 
+            head_points=head_points, 
+            head_bbox=head_bbox,
+            neck_info=neck_info
         )
         
         # Add human detection debug data
@@ -685,13 +769,14 @@ def main():
             'selected_box': human_boxes[0] if len(human_boxes) > 0 else None
         }
         
-        # Save debug images
-        save_debug_images(
-            img=img,
-            video_name=args.data_dir,
-            frame_idx=idx,
-            **debug_data
-        )
+        # # Save debug images
+        # save_debug_images(
+        #     img=img,
+        #     video_name=args.data_dir,
+        #     frame_idx=idx,
+        #     head_segmentation=args.head_segmentation,
+        #     **debug_data
+        # )
     
     print("Processing complete!")
 
