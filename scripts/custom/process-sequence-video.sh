@@ -108,7 +108,7 @@ if [ ! -f "$VIDEO_FOLDER/poses.npz" ] || [ "$FORCE_RERUN" = true ]; then
     --pose $VIDEO_FOLDER/poses.npz \
     --headless \
     --fps 10 \
-    --image_folder $PREPROCESSED_IMAGE_FOLDER \
+    --image_folder $INPUT_IMAGE_FOLDER \
     --skeleton_only
 else
   echo "ROMP output exists. Skipping."
@@ -134,7 +134,7 @@ if [ ! -f "$VIDEO_FOLDER/output.mp4" ] || [ "$FORCE_RERUN" = true ]; then
     --pose $VIDEO_FOLDER/poses_optimized.npz \
     --headless \
     --fps 10 \
-    --image_folder $PREPROCESSED_IMAGE_FOLDER
+    --image_folder $INPUT_IMAGE_FOLDER
 else
   echo "Output video exists. Skipping."
 fi
