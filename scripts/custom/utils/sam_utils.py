@@ -278,12 +278,12 @@ class HeadPointEstimator:
                 if orientation['direction'] == 'left':
                     print("Direction: Left - Adjusting padding")
                     base_padding['right'] *= 2.0  # More padding where face extends
-                    base_padding['left'] *= 0.5   # Less padding on back of head
+                    base_padding['left'] *= 0.6   # Less padding on back of head
                     print(f"After adjustment: {base_padding}")
                 elif orientation['direction'] == 'right':
                     print("Direction: Right - Adjusting padding")
                     base_padding['left'] *= 2.0   # More padding where face extends
-                    base_padding['right'] *= 0.5  # Less padding on back of head
+                    base_padding['right'] *= 0.6  # Less padding on back of head
                     print(f"After adjustment: {base_padding}")
             
             print(f"Final padding values: {base_padding}")
@@ -368,7 +368,7 @@ class HeadPointEstimator:
                 min_xy[0] - width * padding['left'],
                 nose_point[1] - nose_neck_distance * 1.2,  # Top of head
                 max_xy[0] + width * padding['right'],
-                nose_point[1] + nose_neck_distance * 0.7   # Bottom of head
+                nose_point[1] + nose_neck_distance * 0.6   # Bottom of head
             ])
         else:
             # Fallback to original calculation if nose or neck not detected

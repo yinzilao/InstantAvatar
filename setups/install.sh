@@ -203,3 +203,16 @@ PREPROCESSED_IMAGE_FOLDER="preprocessed_images"
 python scripts/custom/run-sam.py --data_dir $VIDEO_FOLDER --image_folder $PREPROCESSED_IMAGE_FOLDER
 
 python scripts/custom/refine-smpl-large-errors.py     --data_dir $VIDEO_FOLDER     --gender $GENDER     --silhouette
+
+###==================
+# TEST modelscope SOLIDER - failed
+pip install modelscope[cv] -f https://modelscope.oss-cn-beijing.aliyuncs.com/releases/repo.html
+python scripts/custom/utils/test_solider.py
+
+pip install -r requirements_modelscope.txt --no-deps
+python scripts/custom/utils/test_solider.py
+
+# Test SOLIDER official
+pip install mmcv-full -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0/index.html
+pip install gdown
+python scripts/custom/utils/test_solider.py

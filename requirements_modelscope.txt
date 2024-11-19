@@ -1,0 +1,16 @@
+datasets==2.13.0
+pyarrow==6.0.1
+simplejson>=3.3.0
+sortedcontainers>=1.5.9
+gast>=0.2.2
+oss2
+addict
+yapf
+einops
+ftfy
+regex
+transformers
+safetensors
+modelscope==1.9.2 
+
+#pip install -r requirements_modelscope.txt --no-deps

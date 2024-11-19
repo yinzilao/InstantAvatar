@@ -10,6 +10,7 @@ class HairSegmenter:
         self.color_threshold = 45
         self.texture_threshold = 0.4
         self.min_hair_area = 100  # Minimum area for connected components
+        self.attention_channels = 32  # Number of channels for attention features
         
     def get_validated_hair_mask(self, image, face_mask, head_bbox, confidence):
         """Hair segmentation with validation pipeline"""
@@ -126,8 +127,25 @@ class HairSegmenter:
         
         return thresholds
         
+    def spatial_attention(self, features, face_mask):
+        """
+        Compute spatial attention weights based on face context
+        """
+        # Convert face mask to attention guide
+        face_attention = cv2.distanceTransform(face_mask.astype(np.uint8), cv2.DIST_L2, 5)
+        face_attention = face_attention / face_attention.max()  # Normalize to [0,1]
+        
+        # Generate gaussian falloff from face boundary
+        face_boundary = cv2.dilate(face_mask.astype(np.uint8), None) - face_mask.astype(np.uint8)
+        boundary_distance = cv2.distanceTransform((1-face_boundary).astype(np.uint8), cv2.DIST_L2, 5)
+        boundary_attention = np.exp(-boundary_distance / 50.0)  # Adjust falloff rate
+        
+        # Combine attention maps
+        attention_weights = (face_attention + boundary_attention) / 2
+        return attention_weights
+        
     def get_hair_candidates(self, image, face_color_model, bbox, confidence):
-        """Generate hair region candidates"""
+        """Enhanced hair candidate generation with attention"""
         try:
             # Convert to multiple color spaces
             hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -140,34 +158,43 @@ class HairSegmenter:
             y2 = min(h, int(bbox[3]))
             x2 = min(w, int(bbox[2]))
             
-            # Texture detection with stricter threshold
+            # Get attention weights
+            attention_weights = self.spatial_attention(image, face_mask)
+            
+            # Apply attention to texture detection
             gradient_x = filters.sobel_h(gray_image)
             gradient_y = filters.sobel_v(gray_image)
             gradient = np.sqrt(gradient_x**2 + gradient_y**2)
-            texture_mask = gradient > np.percentile(gradient, 60)  # Increased threshold
             
-            # Create spatial mask relative to clipped bbox
+            # Modulate gradient by attention
+            attended_gradient = gradient * attention_weights
+            texture_mask = attended_gradient > np.percentile(attended_gradient, 60)
+            
+            # Enhanced spatial masking with attention guidance
             spatial_mask = np.zeros_like(gray_image, dtype=bool)
             head_height = y2 - y1
-            spatial_mask[
-                max(0, y1):min(h, y1+int(head_height)),  # Only above face
-                max(0, x1-int((x2-x1)*0.2)):min(w, x2+int((x2-x1)*0.2))
-            ] = 1
             
-            # Combine masks
+            # Create attention-guided spatial window
+            attention_threshold = 0.3  # Adjust based on desired strictness
+            spatial_mask = attention_weights > attention_threshold
+            
+            # Combine masks with attention weighting
             hair_candidates = texture_mask & spatial_mask
             
+            # Apply final attention refinement
+            hair_candidates = hair_candidates & (attention_weights > 0.1)
+            
             return hair_candidates
-
+            
         except Exception as e:
             print(f"Error in hair candidate generation: {e}")
             return None
         
     def grow_hair_regions(self, candidates, face_mask, bbox):
-        """Grow regions from face boundary with improved coverage"""
+        """Enhanced region growing with attention guidance"""
         if candidates is None or face_mask is None:
             return None
-        
+            
         # Expand face boundary for better hair coverage
         dilated_face = morphology.dilation(face_mask, morphology.disk(5))
         face_boundary = dilated_face & ~face_mask
@@ -178,16 +205,14 @@ class HairSegmenter:
         face_boundary[:y1] = 0
         face_boundary[y2:] = 0
         
-        # Initialize multiple seeds from face boundary
+        # Generate attention weights for region growing
+        attention_weights = self.spatial_attention(candidates, face_mask)
+        
+        # Use attention-guided flood filling
         seeds = face_boundary & candidates
-        if not np.any(seeds):
-            return None
-        
-        # Grow from multiple seed points
         result_mask = np.zeros_like(candidates)
-        seed_points = np.where(seeds)
+        seed_points = np.where(seeds & (attention_weights > 0.5))  # Only use high-attention seeds
         
-        # Take multiple seed points
         num_seeds = min(5, len(seed_points[0]))
         for i in range(num_seeds):
             idx = i * len(seed_points[0]) // num_seeds
@@ -195,8 +220,9 @@ class HairSegmenter:
             seed_x = seed_points[1][idx]
             
             try:
+                # Use attention weights to guide region growing
                 mask = morphology.flood_fill(
-                    candidates.copy(),
+                    (candidates & (attention_weights > 0.2)).copy(),  # Only grow through attention-valid regions
                     (seed_y, seed_x),
                     1
                 )
