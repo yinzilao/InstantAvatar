@@ -7,14 +7,15 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--image_folder", type=str, required=True)
-    parser.add_argument("--mask_folder", type=str, required=True)
-    parser.add_argument("--masked_images_folder", type=str, required=True)
+    parser.add_argument("--input_image_folder", type=str, required=True)
+    parser.add_argument("--input_mask_folder", type=str, required=True)
+    parser.add_argument("--output_mask_folder", type=str, required=True)
+    parser.add_argument("--output_masked_images_folder", type=str, required=True)
     args = parser.parse_args()
 
-    os.makedirs(os.path.join(args.data_dir, args.mask_folder), exist_ok=True)
-    os.makedirs(os.path.join(args.data_dir, args.masked_images_folder), exist_ok=True)
-    for fn in glob.glob(f"{args.data_dir}/masks_sam/*.png"):
+    os.makedirs(os.path.join(args.data_dir, args.output_mask_folder), exist_ok=True)
+    os.makedirs(os.path.join(args.data_dir, args.output_masked_images_folder), exist_ok=True)
+    for fn in glob.glob(f"{args.data_dir}/{args.input_mask_folder}/*.png"):
         img = cv2.imread(fn, cv2.IMREAD_GRAYSCALE)
 
         _, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY)
@@ -46,9 +47,9 @@ if __name__ == "__main__":
             largest_component_index = 0
         largest_component_mask = (labels == largest_component_index).astype(np.uint8) * 255
 
-        cv2.imwrite(fn.replace("masks_sam", args.mask_folder), largest_component_mask)
+        cv2.imwrite(fn.replace(args.input_mask_folder, args.output_mask_folder), largest_component_mask)
 
         mask = largest_component_mask > 0
-        img = cv2.imread(fn.replace("masks_sam", args.image_folder))
+        img = cv2.imread(fn.replace(args.input_mask_folder, args.input_image_folder))
         img[~mask] = 0
-        cv2.imwrite(fn.replace("masks_sam", args.masked_images_folder), img)
+        cv2.imwrite(fn.replace(args.input_mask_folder, args.output_masked_images_folder), img)

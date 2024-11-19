@@ -43,6 +43,7 @@ GENDER=$3
 
 RAW_IMAGE_FOLDER="raw_images"
 PREPROCESSED_IMAGE_FOLDER="preprocessed_images"
+INPUT_IMAGE_FOLDER=$RAW_IMAGE_FOLDER
 
 # Preprocess video frames
 if [ ! -d "$VIDEO_FOLDER/$PREPROCESSED_IMAGE_FOLDER" ] || [ "$FORCE_RERUN" = true ]; then
@@ -62,41 +63,44 @@ fi
 
 # Run OpenPose
 if [ ! -f "$VIDEO_FOLDER/keypoints.npy" ] || [ "$FORCE_RERUN" = true ]; then
-  echo "Running OpenPose for $VIDEO_FOLDER/$PREPROCESSED_IMAGE_FOLDER"
-  bash scripts/custom/run-openpose-bin.sh $VIDEO_FOLDER/$PREPROCESSED_IMAGE_FOLDER
+  echo "Running OpenPose for $VIDEO_FOLDER/$INPUT_IMAGE_FOLDER"
+  bash scripts/custom/run-openpose-bin.sh $VIDEO_FOLDER/$INPUT_IMAGE_FOLDER
   echo "OpenPose output in $VIDEO_FOLDER/openpose_json"
 else
   echo "OpenPose output exists. Skipping."
 fi
 
-MASKED_IMAGES_FOLDER="masked_images"
-MASK_FOLDER="masks"
 # Run SAM
 if [ ! -d "$VIDEO_FOLDER/$MASK_FOLDER" ] || [ "$FORCE_RERUN" = true ]; then
   echo "Running mask in $VIDEO_FOLDER"
   python scripts/custom/run-sam.py \
     --data_dir $VIDEO_FOLDER \
-    --image_folder $PREPROCESSED_IMAGE_FOLDER
+    --image_folder $INPUT_IMAGE_FOLDER
   # python scripts/custom/run-rvm.py --data_dir $VIDEO_FOLDER
 
   # detect head segmentation with SCHP
-  python scripts/custom/run-schp.py --data_dir $VIDEO_FOLDER --image_folder $PREPROCESSED_IMAGE_FOLDER
+  python scripts/custom/run-schp.py --data_dir $VIDEO_FOLDER --image_folder $INPUT_IMAGE_FOLDER
 
+  INPUT_MASK_FOLDER="body_only_masks_schp"
+  OUTPUT_MASK_FOLDER="masks"
+  OUTPUT_MASKED_IMAGES_FOLDER="masked_images"
   python scripts/custom/extract-largest-connected-components.py \
     --data_dir $VIDEO_FOLDER \
-    --image_folder $PREPROCESSED_IMAGE_FOLDER \
-    --mask_folder $MASK_FOLDER \
-    --masked_images_folder $MASKED_IMAGES_FOLDER
+    --input_image_folder $INPUT_IMAGE_FOLDER \
+    --input_mask_folder $INPUT_MASK_FOLDER \
+    --output_mask_folder $OUTPUT_MASK_FOLDER \
+    --output_masked_images_folder $OUTPUT_MASKED_IMAGES_FOLDER
 else
   echo "Masks folder exists. Skipping."
 fi
 
+MASKED_IMAGES_FOLDER=$OUTPUT_MASKED_IMAGES_FOLDER
 # Run ROMP
 if [ ! -f "$VIDEO_FOLDER/poses.npz" ] || [ "$FORCE_RERUN" = true ]; then
-  # python scripts/custom/run-romp.py --data_dir $VIDEO_FOLDER --image_folder $PREPROCESSED_IMAGE_FOLDER
-  python scripts/custom/run-romp.py \
-    --data_dir $VIDEO_FOLDER \
-    --image_folder $MASKED_IMAGES_FOLDER
+  python scripts/custom/run-romp.py --data_dir $VIDEO_FOLDER --image_folder $INPUT_IMAGE_FOLDER
+  # python scripts/custom/run-romp.py \
+  #   --data_dir $VIDEO_FOLDER \
+  #   --image_folder $MASKED_IMAGES_FOLDER
 
   python scripts/visualize-SMPL.py \
     --path $VIDEO_FOLDER \
