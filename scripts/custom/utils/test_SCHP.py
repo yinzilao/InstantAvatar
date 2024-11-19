@@ -6,35 +6,66 @@ import sys
 from pathlib import Path
 import subprocess
 import cv2
+from enum import Enum
 
 # Add SCHP to path
 SCHP_PATH = Path("third_parties/Self-Correction-Human-Parsing")
 sys.path.append(str(SCHP_PATH))
 
-# Import labels for ATR dataset
-ATR_LABELS = ['Background', 'Hat', 'Hair', 'Sunglasses', 'Upper-clothes', 'Skirt', 'Pants', 
-              'Dress', 'Belt', 'Left-shoe', 'Right-shoe', 'Face', 'Left-leg', 'Right-leg', 
-              'Left-arm', 'Right-arm', 'Bag', 'Scarf']
+class ModelType(Enum):
+    LIP = 'lip'
+    ATR = 'atr'
+    PASCAL = 'pascal'
 
-def setup_schp():
-    """Initialize SCHP model with ATR dataset weights"""
-    dataset = 'atr'
-    model_path = SCHP_PATH / "pretrained_models/exp-schp-201908301523-atr.pth"
+# Define labels for each model
+LABELS_BY_MODEL = {
+    ModelType.LIP: [
+        'Background', 'Hat', 'Hair', 'Glove', 'Sunglasses', 'Upper-clothes', 
+        'Dress', 'Coat', 'Socks', 'Pants', 'Jumpsuits', 'Scarf', 'Skirt', 
+        'Face', 'Left-arm', 'Right-arm', 'Left-leg', 'Right-leg', 'Left-shoe', 
+        'Right-shoe'
+    ],
+    ModelType.ATR: [
+        'Background', 'Hat', 'Hair', 'Sunglasses', 'Upper-clothes', 'Skirt', 
+        'Pants', 'Dress', 'Belt', 'Left-shoe', 'Right-shoe', 'Face', 'Left-leg', 
+        'Right-leg', 'Left-arm', 'Right-arm', 'Bag', 'Scarf'
+    ],
+    ModelType.PASCAL: [
+        'Background', 'Head', 'Torso', 'Upper Arms', 'Lower Arms', 'Upper Legs', 
+        'Lower Legs'
+    ]
+}
+
+MODEL_PATHS = {
+    ModelType.LIP: "exp-schp-201908261155-lip.pth",
+    ModelType.ATR: "exp-schp-201908301523-atr.pth",
+    ModelType.PASCAL: "exp-schp-201908270938-pascal-person-part.pth"
+}
+
+# Define head-related labels for each model
+HEAD_LABELS_BY_MODEL = {
+    ModelType.LIP: {'Hat', 'Hair', 'Face'},  # From README.md line 34
+    ModelType.ATR: {'Hat', 'Hair', 'Face'},  # From README.md line 40
+    ModelType.PASCAL: {'Head'}               # From README.md line 46
+}
+
+def setup_schp(model_type: ModelType):
+    """Initialize SCHP model with specified dataset weights"""
+    model_path = SCHP_PATH / "pretrained_models" / MODEL_PATHS[model_type]
     
     if not model_path.exists():
         raise FileNotFoundError(
-            f"Model file not found at {model_path}. Please download it from: "
-            "https://drive.google.com/file/d/1ruJg4lqR_jgQPj-9K0PP-L2vJERYOxLP/view"
+            f"Model file not found at {model_path}. Please download it from the SCHP repository."
         )
     
     input_dir = "data/custom/e1/raw_images"
-    output_dir = "data/custom/e1/test_schp/parsing_results"
+    output_dir = f"data/custom/e1/test_schp/{model_type.value}/parsing_results"
     os.makedirs(output_dir, exist_ok=True)
     
     cmd = [
         "python", 
         str(SCHP_PATH / "simple_extractor.py"),
-        "--dataset", dataset,
+        "--dataset", model_type.value,
         "--model-restore", str(model_path),
         "--input-dir", input_dir,
         "--output-dir", output_dir,
@@ -44,26 +75,32 @@ def setup_schp():
     subprocess.run(cmd, check=True)
     return output_dir
 
-def create_head_masks(parsing_dir, output_dir, debug_dir):
+def create_head_masks(model_type: ModelType, parsing_dir, output_dir, debug_dir):
     """Create binary masks for head regions from parsing results"""
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(debug_dir, exist_ok=True)
     
-    # Get indices for head-related labels using ATR labels
-    head_label_names = {'Hat', 'Hair', 'Face'}
-    head_labels = {ATR_LABELS.index(label) for label in head_label_names}
+    labels = LABELS_BY_MODEL[model_type]
+    head_label_names = HEAD_LABELS_BY_MODEL[model_type]
+    head_labels = {labels.index(label) for label in head_label_names if label in labels}
     
     # Create color map for all labels
     np.random.seed(42)
     all_label_colors = {
         i: tuple(map(int, np.random.randint(0, 255, 3)))
-        for i in range(len(ATR_LABELS))
+        for i in range(len(labels))
     }
     
-    # Special colors for head parts
-    all_label_colors[ATR_LABELS.index('Hat')] = (255, 0, 0)    # Red
-    all_label_colors[ATR_LABELS.index('Hair')] = (0, 255, 0)   # Green
-    all_label_colors[ATR_LABELS.index('Face')] = (0, 0, 255)   # Blue
+    # Special colors for head parts based on model type
+    if model_type == ModelType.PASCAL:
+        all_label_colors[labels.index('Head')] = (0, 255, 0)  # Green
+    else:
+        if 'Hat' in labels:
+            all_label_colors[labels.index('Hat')] = (255, 0, 0)    # Red
+        if 'Hair' in labels:
+            all_label_colors[labels.index('Hair')] = (0, 255, 0)   # Green
+        if 'Face' in labels:
+            all_label_colors[labels.index('Face')] = (0, 0, 255)   # Blue
     
     for parsing_file in os.listdir(parsing_dir):
         if not parsing_file.endswith('.png'):
@@ -85,7 +122,7 @@ def create_head_masks(parsing_dir, output_dir, debug_dir):
             debug_img = cv2.addWeighted(orig_img, 0.7, parsing_vis, 0.3, 0)
             
             # Add label names in the center of each segment
-            for label_idx, label_name in enumerate(ATR_LABELS):
+            for label_idx, label_name in enumerate(labels):
                 # Get mask for current label
                 mask = parsing == label_idx
                 if not np.any(mask):
@@ -131,13 +168,17 @@ def create_head_masks(parsing_dir, output_dir, debug_dir):
         Image.fromarray(head_mask.astype(np.uint8)).save(output_path)
 
 def main():
-    output_dir = Path("data/custom/e1/test_schp")
-    parsing_dir = setup_schp()
+    # Choose model type
+    model_type = ModelType.PASCAL  # Change this to use different models
+    
+    output_dir = Path(f"data/custom/e1/test_schp/{model_type.value}")
+    parsing_dir = setup_schp(model_type)
     head_masks_dir = output_dir / "head_masks"
     debug_dir = output_dir / "debug"
     
+    print(f"Using {model_type.value} model...")
     print("Creating head masks and debug visualizations...")
-    create_head_masks(parsing_dir, head_masks_dir, debug_dir)
+    create_head_masks(model_type, parsing_dir, head_masks_dir, debug_dir)
     print("Processing complete!")
 
 if __name__ == "__main__":
