@@ -549,13 +549,12 @@ def shape_parameter_regularization(betas, original_dim=10):
     if len(betas.shape) == 1:
         betas = betas.unsqueeze(0)  # Add batch dimension if missing
 
-    # Less regularization for original parameters
-    primary_reg = betas[:, :original_dim].pow(2).mean()
-
     # Stronger regularization for additional parameters
-    secondary_reg = betas[:, original_dim:].pow(2).mean() * 10.0
+    weights = [0.5, 1.5]
+    primary_reg = betas[:, :original_dim].pow(2).mean()
+    secondary_reg = betas[:, original_dim:].pow(2).mean()
     
-    return primary_reg + secondary_reg
+    return (weights[0] * primary_reg + weights[1] * secondary_reg)/sum(weights)
 
 @torch.no_grad()
 def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1, use_temporal_smoothness=False):
@@ -913,7 +912,6 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                         cv2.imwrite(debug_path, sil_no_head)
                         print(f"Saved no-head silhouette for frame {i}")
 
-                # Use the better matching silhouette
                 loss_silhouette = loss_silhouette_no_head
 
                 # Rest of the loss computation
