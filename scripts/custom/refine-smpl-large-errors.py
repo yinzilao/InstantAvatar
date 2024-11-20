@@ -907,9 +907,21 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                         sil_no_head = silhouette_no_head[batch_idx].detach().cpu().numpy()
                         sil_no_head = (sil_no_head * 255).astype(np.uint8)
                         
+                        # Get the corresponding mask
+                        mask = batch_masks_local[batch_idx].detach().cpu().numpy()
+                        mask = (mask * 255).astype(np.uint8)
+                        
+                        # Create masked image (red = silhouette, green = mask)
+                        masked_img = np.zeros((sil_no_head.shape[0], sil_no_head.shape[1], 3), dtype=np.uint8)
+                        masked_img[..., 2] = sil_no_head  # Red channel for silhouette
+                        masked_img[..., 1] = mask         # Green channel for mask
+                        
                         # Save the silhouette
-                        debug_path = os.path.join(debug_dir, f'silhouette_no_head_{i:04d}.png')
-                        cv2.imwrite(debug_path, sil_no_head)
+                        debug_path_sil = os.path.join(debug_dir, f'silhouette_no_head_{i:04d}.png')
+                        debug_path_masked = os.path.join(debug_dir, f'masked_{i:04d}.png')
+
+                        cv2.imwrite(debug_path_sil, sil_no_head)
+                        cv2.imwrite(debug_path_masked, masked_img)
                         print(f"Saved no-head silhouette for frame {i}")
 
                 loss_silhouette = loss_silhouette_no_head
