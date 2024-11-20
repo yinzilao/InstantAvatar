@@ -22,9 +22,12 @@ from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_euler_angles
 import trimesh
 
 DEVICE = "cuda"
+SHAPE_LR = 8e-3
+POSE_LR = 1e-3
 
+BATCHSIZE = 12  # Conservative batch size, increase if memory allows
 
-def optimize(optimizer, closure, max_iter=10):
+def optimize(optimizer_shape, optimizer_pose, closure, max_iter=100):
     pbar = tqdm(range(max_iter))
     prev_loss = float('inf')
     best_loss = None
@@ -33,7 +36,9 @@ def optimize(optimizer, closure, max_iter=10):
     min_improvement = 1e-8
     
     for i in pbar:
-        loss = optimizer.step(closure)
+        loss = optimizer_shape.step(closure)
+        loss += optimizer_pose.step(closure)
+
         current_loss = loss.detach().cpu().numpy()
 
         # Initialize best_loss on first iteration
@@ -664,10 +669,14 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             tensor = torch.from_numpy(v).clone().to(DEVICE)
             params[k] = nn.Parameter(tensor)
 
-    # optimize with keypoints
-    optimizer = torch.optim.Adam(params.values(), lr=1e-3)
+    # Different learning rates for shape and pose
+    optimizer_shape = torch.optim.Adam([params['betas']], lr=SHAPE_LR)  # Higher learning rate for shape
+    optimizer_pose = torch.optim.Adam([params['body_pose'], params['global_orient']], lr=POSE_LR)
+    
     def closure():
-        optimizer.zero_grad()
+        optimizer_shape.zero_grad()
+        optimizer_pose.zero_grad()
+
         smpl_output = body_model(**params)
         keypoints_pred = project(projection_matrices, joint_mapper(smpl_output))
         
@@ -741,7 +750,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             # you may need to adjust this value based on your specific needs. 
             # A smaller value will allow more freedom in the shape parameters, 
             # while a larger value will constrain them more strongly.
-            weights = [0.5, 0.005, 0.1]
+            weights = [0.5, 0.0001, 0.1]
             total_loss = (weights[0] * keypoint_loss 
                          + weights[1] * shape_reg 
                          + weights[2] * pose_prior)
@@ -761,7 +770,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
 
         return total_loss
     
-    optimize(optimizer, closure, max_iter=10)
+    optimize(optimizer_shape, optimizer_pose, closure, max_iter=100)
 
     def create_headless_mesh(smpl_output, body_model):
         vertices = smpl_output.vertices.clone()
@@ -817,16 +826,16 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             os.makedirs(debug_dir, exist_ok=True)
 
         # Process frames in small batches to improve speed while maintaining memory efficiency
-        BATCH_SIZE = 10  # Conservative batch size, increase if memory allows
-        for i in range(0, len(masks), BATCH_SIZE):
-            batch_end = min(i + BATCH_SIZE, len(masks))
+        for i in range(0, len(masks), BATCHSIZE):
+            batch_end = min(i + BATCHSIZE, len(masks))
             batch_masks = torch.from_numpy(masks[i:batch_end]).float().to(DEVICE) / 255
             
-            optimizer = torch.optim.Adam(params.values(), lr=1e-3)
+            optimizer_shape = torch.optim.Adam([params['betas']], lr=SHAPE_LR)
+            optimizer_pose = torch.optim.Adam([params['body_pose'], params['global_orient']], lr=POSE_LR)
             
             def closure():
-                optimizer.zero_grad()
-
+                optimizer_shape.zero_grad()
+                optimizer_pose.zero_grad()
                 # Get SMPL output for batch
                 smpl_output = body_model(
                     betas=params["betas"].clone().detach(),
@@ -869,7 +878,6 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                         nose_y = torch.clamp(nose_y, 0, silhouette_no_head.shape[1]-1)
                         
                         # Sample silhouette values at nose positions
-                        nose_values_full = []
                         nose_values_no_head = []
                         
                         for b in range(batch_end - i):
@@ -942,7 +950,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                 # you may need to adjust this value based on your specific needs. 
                 # A smaller value will allow more freedom in the shape parameters, 
                 # while a larger value will constrain them more strongly.
-                weights = [15.0, 0.0001, 0.005, 1.0, 1.0] 
+                weights = [20.0, 0.00001, 0.005, 1.0, 1.0] 
                 loss = (weights[0] * loss_silhouette 
                         + weights[1] * shape_reg
                         + weights[2] * loss_keypoints 
@@ -957,7 +965,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                 loss.backward()
                 return loss
 
-            optimize(optimizer, closure, max_iter=100)
+            optimize(optimizer_shape, optimizer_pose, closure, max_iter=15000)
 
     smpl_params = dict(smpl_params)
     for k in smpl_params:
