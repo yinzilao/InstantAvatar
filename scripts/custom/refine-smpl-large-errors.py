@@ -28,7 +28,7 @@ def optimize(optimizer, closure, max_iter=10):
     pbar = tqdm(range(max_iter))
     prev_loss = float('inf')
     best_loss = None
-    patience = 3
+    patience = 5
     patience_counter = 0
     min_improvement = 1e-8
     
@@ -541,6 +541,22 @@ def angle_magnitude_prior(body_pose):
     excess = torch.clamp(rotation_magnitudes - threshold, min=0)
     return excess.mean()
 
+def shape_parameter_regularization(betas, original_dim=10):
+    """
+    Apply stronger regularization to higher-order shape parameters
+    """
+    # Ensure betas has correct shape (add batch dim if needed)
+    if len(betas.shape) == 1:
+        betas = betas.unsqueeze(0)  # Add batch dimension if missing
+
+    # Less regularization for original parameters
+    primary_reg = betas[:, :original_dim].pow(2).mean()
+
+    # Stronger regularization for additional parameters
+    secondary_reg = betas[:, original_dim:].pow(2).mean() * 10.0
+    
+    return primary_reg + secondary_reg
+
 @torch.no_grad()
 def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1, use_temporal_smoothness=False):
     camera = dict(np.load(f"{root}/cameras.npz"))
@@ -577,6 +593,32 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
     for k, v in smpl_params.items():
         print(f"  {k}: {v.shape} (min: {v.min():.3f}, max: {v.max():.3f})")
 
+     # Modify the SMPL model initialization to use all shape parameters
+    body_model = smplx.SMPL(
+        "./data/SMPLX/smpl", 
+        gender=gender,
+        num_betas=300,  # Change from default 10 to 300
+        use_hands=False,
+        use_feet=False,
+        use_face=False,
+    )
+
+    # Verify model capabilities
+    print("\nVerifying SMPL Model:")
+    print(f"Gender: {body_model.gender}")
+    print(f"Shape space dimension: {body_model.SHAPE_SPACE_DIM}")
+    print(f"Actual shape components: {body_model.shapedirs.shape[-1]}")
+    
+    # Check if shapedirs matches expected dimension
+    if body_model.shapedirs.shape[-1] < 300:
+        raise ValueError(
+            f"Model only supports {body_model.shapedirs.shape[-1]} shape components. "
+            "Please ensure you're using the 300 PC model!"
+        )
+    
+    body_model.to(DEVICE)
+
+    # When loading or initializing betas, expand to 300 dimensions
     params = {}
     for k, v in smpl_params.items():
         if k == "thetas":
@@ -585,15 +627,43 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             tensor = torch.from_numpy(v[:, 3:]).clone().to(DEVICE)
             params["body_pose"] = nn.Parameter(tensor)
         elif k == "betas":
-            tensor = torch.from_numpy(v).clone().to(DEVICE)
-            params[k] = nn.Parameter(tensor[None])
-            # params[k] = tensor[None]
+            # Debug original betas
+            print(f"\nDebug Shape Parameters:")
+            print(f"Original betas shape: {v.shape}")
+            
+            # Expand betas to 300 dimensions
+            original_betas = torch.from_numpy(v).clone()
+            if len(original_betas.shape) == 1:
+                original_betas = original_betas.unsqueeze(0) # Add batch dimension if missing
+            print(f"After unsqueeze shape: {original_betas.shape}")
+            
+            expanded_betas = torch.zeros((original_betas.shape[0], 300), device=DEVICE)
+            expanded_betas[:, :original_betas.shape[1]] = original_betas  # Copy existing betas
+            print(f"Expanded betas shape: {expanded_betas.shape}")
+
+            # Initialize remaining betas with small random values
+            expanded_betas[:, original_betas.shape[1]:] = torch.randn(
+                (original_betas.shape[0], 300 - original_betas.shape[1]), 
+                device=DEVICE) * 0.0001  # Small initialization
+            
+            # Check SMPL model's shape capabilities
+            print("\nSMPL Model Shape Information:")
+            print(f"Model's shape space dim: {body_model.SHAPE_SPACE_DIM}")
+            print(f"Model's shapedirs shape: {body_model.shapedirs.shape}")
+             # Verify the actual shape components available
+            num_available_shapes = body_model.shapedirs.shape[-1]
+            print(f"Number of available shape components: {num_available_shapes}")
+            
+            if num_available_shapes < 300:
+                print("WARNING: Model does not support 300 PCs!")
+                print("Using limited number of shape components.")
+            else:
+                print("Successfully using 300 PCs model!")
+                
+            params[k] = nn.Parameter(expanded_betas)
         else:
             tensor = torch.from_numpy(v).clone().to(DEVICE)
             params[k] = nn.Parameter(tensor)
-
-    body_model = smplx.SMPL("./data/SMPLX/smpl", gender=gender)
-    body_model.to(DEVICE)
 
     # optimize with keypoints
     optimizer = torch.optim.Adam(params.values(), lr=1e-3)
@@ -641,7 +711,8 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
         error = error * mask.float() * keypoint_weights
         
         # 3. Log-space loss for better numerical stability
-        loss = torch.log1p(error[:, SELECT_JOINTS]).mean()
+        keypoint_loss = torch.log1p(error[:, SELECT_JOINTS]).mean()
+        shape_reg = shape_parameter_regularization(params['betas'][0])
         pose_prior = pose_prior_loss(params['body_pose'])
 
         # Only add temporal smoothness if enabled
@@ -650,16 +721,34 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             smoothness_loss = temporal_smoothness_loss(smpl_output.vertices, window_size=3, loss_downgrade=loss_downgrade)
             pose_smoothness = pose_smoothness_loss(params['body_pose'])
 
-            total_loss = 0.84 * loss + 0.05 * smoothness_loss + 0.01 * pose_smoothness + 0.1 * pose_prior
-            print(f"Total loss: {total_loss.item():.6f}: Keypoint loss: {loss.item():.6f}, "
-                  f"Smoothness loss: {smoothness_loss.item():.6f}, "
-                  f"Pose smoothness: {pose_smoothness.item():.6f}, "
-                  f"Pose prior: {pose_prior.item():.6f}")
+            # The weight of shape_reg 0.005 for shape regularization is a starting point - 
+            # you may need to adjust this value based on your specific needs. 
+            # A smaller value will allow more freedom in the shape parameters, 
+            # while a larger value will constrain them more strongly.
+            weights = [0.5, 0.0001, 0.1, 0.1, 0.1]
+            total_loss = (weights[0] * keypoint_loss 
+                         + weights[1] * shape_reg 
+                         + weights[2] * smoothness_loss 
+                         + weights[3] * pose_smoothness 
+                         + weights[4] * pose_prior)
+            print(f"Total loss: {total_loss.item():.6f}: \n - Keypoint loss: {keypoint_loss.item():.6f}, weighted keypoint loss: {weights[0] * keypoint_loss.item():.6f}, "
+                  f"\n - Shape regularization: {shape_reg.item():.6f}, weighted shape regularization: {weights[1] * shape_reg.item():.6f}, "
+                  f"\n - Smoothness loss: {smoothness_loss.item():.6f}, weighted smoothness loss: {weights[2] * smoothness_loss.item():.6f}, "
+                  f"\n - Pose smoothness: {pose_smoothness.item():.6f}, weighted pose smoothness: {weights[3] * pose_smoothness.item():.6f}, "
+                  f"\n - Pose prior: {pose_prior.item():.6f}, weighted pose prior: {weights[4] * pose_prior.item():.6f}")
             
         else:
-            total_loss = 0.9 * loss + 0.1 * pose_prior
-            print(f"Total loss: {total_loss.item():.6f}: Keypoint loss: {loss.item():.6f}, "
-                  f"Pose prior: {pose_prior.item():.6f}")
+            # The weight of shape_reg 0.005 for shape regularization is a starting point - 
+            # you may need to adjust this value based on your specific needs. 
+            # A smaller value will allow more freedom in the shape parameters, 
+            # while a larger value will constrain them more strongly.
+            weights = [0.5, 0.005, 0.1]
+            total_loss = (weights[0] * keypoint_loss 
+                         + weights[1] * shape_reg 
+                         + weights[2] * pose_prior)
+            print(f"Total loss: {total_loss.item():.6f}: \n - Keypoint loss: {keypoint_loss.item():.6f}, weighted keypoint loss: {weights[0] * keypoint_loss.item():.6f}, "
+                  f"\n - Shape regularization: {shape_reg.item():.6f}, weighted shape regularization: {weights[1] * shape_reg.item():.6f}, "
+                  f"\n - Pose prior: {pose_prior.item():.6f}, weighted pose prior: {weights[2] * pose_prior.item():.6f}")
 
         if torch.isnan(total_loss):
             print("WARNING: NaN loss detected!")
@@ -673,42 +762,35 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
 
         return total_loss
     
-    optimize(optimizer, closure, max_iter=200)
-
-    # After first optimization
-    smpl_output = body_model(**params)
-    print("\nAfter Keypoint Optimization:")
-    print(f"Vertices shape: {smpl_output.vertices.shape}")
-    print(f"Joints shape: {smpl_output.joints.shape}")
-    for k, v in params.items():
-        print(f"  {k}: {v.shape} (min: {v.min().item():.3f}, max: {v.max().item():.3f})")
+    optimize(optimizer, closure, max_iter=10)
 
     def create_headless_mesh(smpl_output, body_model):
-        vertices_no_head = smpl_output.vertices.clone()
-        batch_size = vertices_no_head.shape[0]
+        vertices = smpl_output.vertices.clone()
+        batch_size = vertices.shape[0]
         
         # Get neck joint position (joint 12 in SMPL)
-        neck_joint_y = smpl_output.joints[0, 12, 1]  # Y coordinate of neck joint
-        print(f"Debug - Neck joint Y: {neck_joint_y:.3f}")
+        neck_joint_y = smpl_output.joints[0, 12, 1]
         
         # Create mask for vertices above neck joint
-        vertices_above_neck = vertices_no_head[0, :, 1] < neck_joint_y
+        vertices_above_neck = vertices[0, :, 1] < neck_joint_y
         HEAD_VERTEX_IDS = torch.where(vertices_above_neck)[0]
-        print(f"Debug - Number of head vertices: {len(HEAD_VERTEX_IDS)}")
         
-        # Move head vertices far away
-        vertices_no_head[..., HEAD_VERTEX_IDS, :] = torch.tensor([0., -1000., -1000.], device=DEVICE)
-        
-        # Get faces that contain any of the head vertices
+        # Create faces mask (faces containing head vertices)
         faces = body_model.faces_tensor[None].repeat(batch_size, 1, 1)
         head_faces_mask = torch.any(torch.isin(faces, HEAD_VERTEX_IDS), dim=-1)
-        faces_no_head = faces.clone()
-        faces_no_head[..., head_faces_mask, :] = 0
         
-        print(f"Debug meshes:")
-        print(f"Original vertices shape: {vertices_no_head.shape}")
-        print(f"Original faces shape: {faces_no_head.shape}")
-        print(f"Number of faces removed: {head_faces_mask.sum().item()}")
+        # Remove head faces by creating new faces tensor without head faces
+        valid_faces = ~head_faces_mask[0]  # Take first batch element since mask is same for all
+        faces_no_head = faces[0, valid_faces, :][None].repeat(batch_size, 1, 1)
+        
+        # Only keep vertices that are used by remaining faces
+        used_vertices = torch.unique(faces_no_head[0])
+        vertices_no_head = vertices[:, used_vertices, :]
+        
+        # Update face indices to match new vertex ordering
+        vertex_map = torch.zeros(vertices.shape[1], dtype=torch.long, device=DEVICE)
+        vertex_map[used_vertices] = torch.arange(len(used_vertices), device=DEVICE)
+        faces_no_head = vertex_map[faces_no_head]
         
         return vertices_no_head, faces_no_head
 
@@ -757,12 +839,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                 # Create meshes for both full and headless versions
                 vertices_no_head, faces_no_head = create_headless_mesh(smpl_output, body_model)
                 
-                # Debug mesh creation
-                meshes_full = Meshes(
-                    verts=smpl_output.vertices.float(),
-                    faces=body_model.faces_tensor[None].repeat(batch_end - i, 1, 1),
-                ).to(DEVICE)
-
+                # mesh creation
                 meshes_no_head = Meshes(
                     verts=vertices_no_head.float(),
                     faces=faces_no_head,
@@ -770,147 +847,77 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
 
                 # Move this line before accessing batch_masks
                 batch_masks_local = batch_masks.clone()  # Create local copy
-
-                print("Debug meshes:")
-                print(f"Full mesh - Vertices: {meshes_full.verts_padded().shape}, Faces: {meshes_full.faces_padded().shape}")
-                print(f"No-head mesh - Vertices: {meshes_no_head.verts_padded().shape}, Faces: {meshes_no_head.faces_padded().shape}")
                 
                 # Render silhouettes
-                silhouette_full = renderer(meshes_full)[..., 3]
                 silhouette_no_head = renderer(meshes_no_head)[..., 3]
-
-                # Add verification check for head area
-                with torch.no_grad():
-                    # Get nose keypoint (index 0 in BODY25)
-                    nose_keypoints = keypoints_2d[i:batch_end, 0, :2]  # [batch_size, 2]
-                    
-                    # Convert to pixel coordinates
-                    nose_x = nose_keypoints[:, 0].long()
-                    nose_y = nose_keypoints[:, 1].long()
-                    
-                    # Ensure coordinates are within image bounds
-                    nose_x = torch.clamp(nose_x, 0, silhouette_no_head.shape[2]-1)
-                    nose_y = torch.clamp(nose_y, 0, silhouette_no_head.shape[1]-1)
-                    
-                    # Sample silhouette values at nose positions
-                    nose_values_full = []
-                    nose_values_no_head = []
-                    
-                    for b in range(batch_end - i):
-                        full_val = silhouette_full[b, nose_y[b], nose_x[b]].item()
-                        no_head_val = silhouette_no_head[b, nose_y[b], nose_x[b]].item()
-                        nose_values_full.append(full_val)
-                        nose_values_no_head.append(no_head_val)
-                        
-                    print(f"\nHead area verification (at nose keypoint):")
-                    print(f"Full silhouette values: {nose_values_full}")
-                    print(f"No-head silhouette values: {nose_values_no_head}")
-                    
-                    # Also check a 5x5 patch around nose
-                    patch_size = 5
-                    for b in range(batch_end - i):
-                        x, y = nose_x[b], nose_y[b]
-                        x1, x2 = max(0, x-patch_size//2), min(silhouette_no_head.shape[2], x+patch_size//2+1)
-                        y1, y2 = max(0, y-patch_size//2), min(silhouette_no_head.shape[1], y+patch_size//2+1)
-                        
-                        patch_full = silhouette_full[b, y1:y2, x1:x2]
-                        patch_no_head = silhouette_no_head[b, y1:y2, x1:x2]
-                        
-                        print(f"\nBatch {b} - 5x5 patch around nose:")
-                        print("Full silhouette patch:")
-                        print(patch_full.cpu().numpy())
-                        print("No-head silhouette patch:")
-                        print(patch_no_head.cpu().numpy())
-
-                # Match test file: Keep > for head vertices
-                # Match test file: Move vertices far away instead of zeroing
-                # Match test file: Face handling
-
-                # Create meshes for both full body and headless
-
-                # Ensure batch dimensions match
-                if silhouette_full.shape[0] != batch_masks_local.shape[0]:
-                    batch_masks_local = batch_masks_local.expand(silhouette_full.shape[0], -1, -1)
-                
-                print("Debug silhouettes:")
-                print(f"Full silhouette shape: {silhouette_full.shape}")
-                print(f"No-head silhouette shape: {silhouette_no_head.shape}")
-                print(f"Full silhouette range: {silhouette_full.min():.3f} to {silhouette_full.max():.3f}")
-                print(f"No-head silhouette range: {silhouette_no_head.min():.3f} to {silhouette_no_head.max():.3f}")
                 
                 if torch.any(torch.isnan(silhouette_no_head)):
                     print("WARNING: NaN values in no-head silhouette!")
-                if torch.any(torch.isnan(silhouette_full)):
-                    print("WARNING: NaN values in full silhouette!")
-                
+
+                # Validation Debug:No-head silhouette should be 0 at nose keypoint 
+                VALIDATION_NO_HEAD = False
+                if VALIDATION_NO_HEAD:
+                    with torch.no_grad():
+                        # Get nose keypoint (index 0 in BODY25)
+                        nose_keypoints = keypoints_2d[i:batch_end, 0, :2]  # [batch_size, 2]
+                        
+                        # Convert to pixel coordinates
+                        nose_x = nose_keypoints[:, 0].long()
+                        nose_y = nose_keypoints[:, 1].long()
+                        
+                        # Ensure coordinates are within image bounds
+                        nose_x = torch.clamp(nose_x, 0, silhouette_no_head.shape[2]-1)
+                        nose_y = torch.clamp(nose_y, 0, silhouette_no_head.shape[1]-1)
+                        
+                        # Sample silhouette values at nose positions
+                        nose_values_full = []
+                        nose_values_no_head = []
+                        
+                        for b in range(batch_end - i):
+                            no_head_val = silhouette_no_head[b, nose_y[b], nose_x[b]].item()
+                            nose_values_no_head.append(no_head_val)
+                            
+                        print(f"\nHead area verification (at nose keypoint):")
+                        print(f"No-head silhouette values: {nose_values_no_head}")
+                        
+                        # Also check a 5x5 patch around nose
+                        patch_size = 5
+                        for b in range(batch_end - i):
+                            x, y = nose_x[b], nose_y[b]
+                            x1, x2 = max(0, x-patch_size//2), min(silhouette_no_head.shape[2], x+patch_size//2+1)
+                            y1, y2 = max(0, y-patch_size//2), min(silhouette_no_head.shape[1], y+patch_size//2+1)
+                            
+                            patch_no_head = silhouette_no_head[b, y1:y2, x1:x2]
+                            
+                            print(f"\nBatch {b} - 5x5 patch around nose:")
+                            print("No-head silhouette patch:")
+                            print(patch_no_head.cpu().numpy())
+
                 # Ensure proper normalization
-                silhouette_full = torch.clamp(silhouette_full, 0, 1)
                 silhouette_no_head = torch.clamp(silhouette_no_head, 0, 1)
+                batch_masks_local = torch.clamp(batch_masks_local, 0, 1)
 
                 # Compare both silhouettes with the mask
-                loss_silhouette_full = F.mse_loss(batch_masks_local, silhouette_full)
                 loss_silhouette_no_head = F.mse_loss(batch_masks_local, silhouette_no_head)
 
                 # Debug visualization with reduced frequency
-                if silhouette_debug and i % 20 == 0:  # Reduced from every 10th to every 20th frame
+                if silhouette_debug and i % 20 == 0:  # Every 20th frame
                     with torch.no_grad():
-                        # Convert tensors to numpy for visualization
-                        # Fix indexing to get the correct frame from the batch
-                        batch_idx = 0  # or any other index within the current batch
-                        sil_full = silhouette_full[batch_idx].detach().cpu().numpy()
+                        batch_idx = 0  # Use first frame in current batch
+                        # Convert no-head silhouette to numpy and scale to 0-255 range
                         sil_no_head = silhouette_no_head[batch_idx].detach().cpu().numpy()
-                        mask_np = batch_masks_local[batch_idx].detach().cpu().numpy()
+                        sil_no_head = (sil_no_head * 255).astype(np.uint8)
                         
-                        # Add debug prints to verify shapes
-                        print(f"Debug shapes - Silhouette full: {sil_full.shape}, "
-                              f"Silhouette no head: {sil_no_head.shape}, "
-                              f"Mask: {mask_np.shape}")
-                        
-                        # Create difference images
-                        diff_full = np.abs(sil_full - mask_np)
-                        diff_no_head = np.abs(sil_no_head - mask_np)
-                        
-                        # Create visualization grid
-                        plt.figure(figsize=(20, 10))
-                        
-                        plt.subplot(231)
-                        plt.imshow(mask_np, cmap='gray')  # Added cmap for consistency
-                        plt.title('Target Mask')
-                        plt.axis('off')
-                        
-                        plt.subplot(232)
-                        plt.imshow(sil_full, cmap='gray')
-                        plt.title('Full Silhouette')
-                        plt.axis('off')
-                        
-                        plt.subplot(233)
-                        plt.imshow(sil_no_head, cmap='gray')
-                        plt.title('No-Head Silhouette')
-                        plt.axis('off')
-                        
-                        plt.subplot(235)
-                        plt.imshow(diff_full, cmap='hot')
-                        plt.title('Full Difference')
-                        plt.colorbar()
-                        plt.axis('off')
-                        
-                        plt.subplot(236)
-                        plt.imshow(diff_no_head, cmap='hot')
-                        plt.title('No-Head Difference')
-                        plt.colorbar()
-                        plt.axis('off')
-                        
-                        plt.suptitle(f'Frame {i} - Loss Full: {loss_silhouette_full:.4f}, Loss No-Head: {loss_silhouette_no_head:.4f}')
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(debug_dir, f'silhouette_comparison_{i:04d}.png'))
-                        print(f"Saved silhouette comparison for frame {i}")
-                        plt.close()
+                        # Save the silhouette
+                        debug_path = os.path.join(debug_dir, f'silhouette_no_head_{i:04d}.png')
+                        cv2.imwrite(debug_path, sil_no_head)
+                        print(f"Saved no-head silhouette for frame {i}")
 
                 # Use the better matching silhouette
-                # loss_silhouette = torch.minimum(loss_silhouette_full, loss_silhouette_no_head)
                 loss_silhouette = loss_silhouette_no_head
 
                 # Rest of the loss computation
+                shape_reg = shape_parameter_regularization(params['betas'][0])
                 keypoints_pred = project(projection_matrices, joint_mapper(smpl_output))
                 loss_keypoints = (keypoints_2d[i:batch_end, :, :2] - keypoints_pred).square().sum(-1).sqrt()
                 
@@ -920,14 +927,27 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                 anatomical_loss = anatomical_pose_prior(params['body_pose'][i:batch_end])
                 magnitude_prior = angle_magnitude_prior(params['body_pose'])
                 
-                loss = (0.7 * loss_silhouette 
-                        + 0.2 * loss_keypoints 
-                        + 0.05 * anatomical_loss 
-                        + 0.05 * magnitude_prior)
+                # shape_reg is to penalize unrealistic shape parameters - for more diverse body shapes, this should be decreased.
+                # The weight of shape_reg 0.005 for shape regularization is a starting point - 
+                # you may need to adjust this value based on your specific needs. 
+                # A smaller value will allow more freedom in the shape parameters, 
+                # while a larger value will constrain them more strongly.
+                weights = [15.0, 0.0001, 0.005, 1.0, 1.0] 
+                loss = (weights[0] * loss_silhouette 
+                        + weights[1] * shape_reg
+                        + weights[2] * loss_keypoints 
+                        + weights[3] * anatomical_loss 
+                        + weights[4] * magnitude_prior)
+                
+                print(f"Loss: {loss.item():.6f}: \n - Silhouette: {loss_silhouette.item():.6f}, weighted loss_silhouette: {weights[0] * loss_silhouette.item():.6f}, "
+                      f"\n - Shape regularization: {shape_reg.item():.6f}, weighted shape regularization: {weights[1] * shape_reg.item():.6f}, "
+                      f"\n - Keypoints: {loss_keypoints.item():.6f}, weighted loss_keypoints: {weights[2] * loss_keypoints.item():.6f}, "
+                      f"\n - Anatomical: {anatomical_loss.item():.6f}, weighted loss_anatomical: {weights[3] * anatomical_loss.item():.6f}, "
+                      f"\n - Magnitude: {magnitude_prior.item():.6f}, weighted loss_magnitude: {weights[4] * magnitude_prior.item():.6f}")
                 loss.backward()
                 return loss
 
-            optimize(optimizer, closure, max_iter=100000)
+            optimize(optimizer, closure, max_iter=100)
 
     smpl_params = dict(smpl_params)
     for k in smpl_params:
