@@ -60,24 +60,62 @@ def scale_gradients(parameters, clip_value=1.0):
             if p.grad is not None:
                 p.grad.mul_(scale)
 
-def optimize(optimizer_shape, optimizer_pose, closure, max_iter=100):
+def optimize(optimizer_shape, optimizer_pose, closure, params, batch_start, batch_end, max_iter=100):
     pbar = tqdm(range(max_iter))
     prev_loss = float('inf')
     patience = 3
     patience_counter = 0
     min_improvement = 1e-6
 
-    # Add schedulers
     scheduler_shape = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_shape, mode='min', factor=0.5, patience=2)
+        optimizer_shape, mode='min', factor=0.5, patience=patience)
     scheduler_pose = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_pose, mode='min', factor=0.5, patience=2)
+        optimizer_pose, mode='min', factor=0.5, patience=patience)
     
     for i in pbar:
-        loss = optimizer_shape.step(closure)
-        loss += optimizer_pose.step(closure)
+        # First optimize shape
+        optimizer_shape.zero_grad()
+        loss_shape = closure(shape_only=True)
+        
+        # Debug info
+        print(f"Shape optimization - loss_shape.requires_grad: {loss_shape.requires_grad}")
+        print(f"params['betas'].requires_grad: {params['betas'].requires_grad}")
+        
+        # if not loss_shape.requires_grad:
+        #     raise ValueError("Loss shape should require grad but it doesn't! "
+        #                      f"loss_shape.requires_grad: {loss_shape.requires_grad}. "
+        #                      "Check computational graph.")
+            
+        loss_shape.backward()
+        scale_gradients(
+            [params['betas']], # betas shared across all frames because body shape doesn't change
+            clip_value=5.0
+        ) 
+        optimizer_shape.step()
 
-        current_loss = loss.detach().cpu().numpy()
+        # Then optimize pose
+        optimizer_pose.zero_grad()
+        loss_pose = closure(shape_only=False)
+        
+        # Debug info
+        print(f"Pose optimization - loss requires grad: {loss_pose.requires_grad}")
+        print(f"Body pose requires grad: {params['body_pose'].requires_grad}")
+        
+        if not loss_pose.requires_grad:
+            raise ValueError(f"Loss pose should require grad but it doesn't! "
+                             f"loss_pose.requires_grad: {loss_pose.requires_grad}. "
+                             "Check computational graph.")
+            
+        loss_pose.backward()
+        scale_gradients(
+            [params['body_pose'][batch_start:batch_end], 
+              params['global_orient'][batch_start:batch_end],
+              params['transl'][batch_start:batch_end]],
+            clip_value=5.0
+        )
+        optimizer_pose.step()
+
+        current_loss = (loss_shape + loss_pose).detach().cpu().numpy()
 
         # Update learning rates
         scheduler_shape.step(current_loss)
@@ -95,6 +133,16 @@ def optimize(optimizer_shape, optimizer_pose, closure, max_iter=100):
             
         prev_loss = current_loss
         pbar.set_postfix_str(f"loss: {current_loss:.6f}")
+
+        # Print gradient norms for debugging
+        if i % 20 == 0:
+            with torch.no_grad():
+                beta_grad_norm = params['betas'].grad.norm().item() if params['betas'].grad is not None else 0
+                pose_grad_norm = params['body_pose'].grad[batch_start:batch_end].norm().item() if params['body_pose'].grad is not None else 0
+                print(f"\nGradient norms:")
+                print(f"Beta gradients: {beta_grad_norm:.6f}")
+                print(f"Pose gradients: {pose_grad_norm:.6f}")
+        
 
 def project(projection_matrices, keypoints_3d):
     p = torch.einsum("ij,mnj->mni", projection_matrices[:3, :3], keypoints_3d) + projection_matrices[:3, 3]
@@ -633,7 +681,6 @@ def shape_specific_loss(silhouette_pred, silhouette_target):
     
     return total_shape_loss
 
-@torch.no_grad()
 def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1, use_temporal_smoothness=False):
     camera = dict(np.load(f"{root}/cameras.npz"))
     if downscale > 1:
@@ -673,42 +720,38 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
     body_model = smplx.SMPL(
         "./data/SMPLX/smpl", 
         gender=gender,
-        num_betas=300,  # Change from default 10 to 300
+        num_betas=300,
         use_hands=False,
         use_feet=False,
         use_face=False,
+        create_global_orient=True,
+        create_body_pose=True,
+        create_betas=True,
+        create_transl=True,
     )
-
-    # Verify model capabilities
-    print("\nVerifying SMPL Model:")
-    print(f"Gender: {body_model.gender}")
-    print(f"Shape space dimension: {body_model.SHAPE_SPACE_DIM}")
-    print(f"Actual shape components: {body_model.shapedirs.shape[-1]}")
-    
-    # Check if shapedirs matches expected dimension
-    if body_model.shapedirs.shape[-1] < 300:
-        raise ValueError(
-            f"Model only supports {body_model.shapedirs.shape[-1]} shape components. "
-            "Please ensure you're using the 300 PC model!"
-        )
-    
     body_model.to(DEVICE)
+    body_model.train()  # Enable gradient computation
+
+    # Verify model parameters
+    print("\nSMPL Model Parameters:")
+    for name, param in body_model.named_parameters():
+        print(f"{name}: requires_grad={param.requires_grad}")
 
     # When loading or initializing betas, expand to 300 dimensions
     params = {}
     for k, v in smpl_params.items():
         if k == "thetas":
             tensor = torch.from_numpy(v[:, :3]).clone().to(DEVICE)
-            params["global_orient"] = nn.Parameter(tensor)
+            params["global_orient"] = nn.Parameter(tensor, requires_grad=True)
             tensor = torch.from_numpy(v[:, 3:]).clone().to(DEVICE)
-            params["body_pose"] = nn.Parameter(tensor)
+            params["body_pose"] = nn.Parameter(tensor, requires_grad=True)
         elif k == "betas":
             # Debug original betas
             print(f"\nDebug Shape Parameters:")
             print(f"Original betas shape: {v.shape}")
             
-            # Expand betas to 300 dimensions
-            original_betas = torch.from_numpy(v).clone()
+            # Move to device immediately after creation
+            original_betas = torch.from_numpy(v).clone().to(DEVICE)
             if len(original_betas.shape) == 1:
                 original_betas = original_betas.unsqueeze(0) # Add batch dimension if missing
             print(f"After unsqueeze shape: {original_betas.shape}")
@@ -736,11 +779,24 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             else:
                 print("Successfully using 300 PCs model!")
                 
-            params[k] = nn.Parameter(expanded_betas)
+            params[k] = nn.Parameter(expanded_betas, requires_grad=True)
         else:
             tensor = torch.from_numpy(v).clone().to(DEVICE)
-            params[k] = nn.Parameter(tensor)
+            params[k] = nn.Parameter(tensor, requires_grad=True)
 
+    # Verify all parameters are properly set up
+    for k, v in params.items():
+        assert isinstance(v, nn.Parameter), f"{k} is not a Parameter"
+        assert v.requires_grad, f"{k} does not require grad"
+        assert v.device.type == DEVICE, f"{k} is not on {DEVICE}"
+
+    # After creating all parameters
+    for name, param in params.items():
+        print(f"{name}:")
+        print(f"  requires_grad: {param.requires_grad}")
+        print(f"  device: {param.device}")
+        print(f"  shape: {param.shape}")
+        
     # Different learning rates for shape and pose
     optimizer_shape = torch.optim.Adam(
         [params['betas']], 
@@ -748,19 +804,18 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
         betas=(0.9, 0.999) 
     )
     optimizer_pose = torch.optim.Adam(
-        [params['body_pose'], params['global_orient']], 
+        [params['body_pose'], params['global_orient'], params['transl']], 
         lr=POSE_LR,
         betas=(0.9, 0.999)
     )
     
-    def closure():
-        optimizer_shape.zero_grad()
-        optimizer_pose.zero_grad()
-
+    def closure(shape_only=False):
         smpl_output = body_model(**params)
         keypoints_pred = project(projection_matrices, joint_mapper(smpl_output))
         
         # Debug prints
+        print(f"\nSMPL output requires grad: {smpl_output.vertices.requires_grad}")
+        print(f"Keypoints pred requires grad: {keypoints_pred.requires_grad}")
         print("\nOptimization step:")
         print(f"SMPL output joints shape: {smpl_output.joints.shape}")
         print(f"Projected keypoints shape: {keypoints_pred.shape}")
@@ -813,7 +868,10 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             # you may need to adjust this value based on your specific needs. 
             # A smaller value will allow more freedom in the shape parameters, 
             # while a larger value will constrain them more strongly.
-            weights = [0.5, 0.001, 0.1, 0.1, 0.1]
+            if shape_only:
+                weights = [0.5, 0.001, 0.1, 0.0, 0.0] # Zero out pose-related weights
+            else:
+                weights = [0.5, 0.001, 0.1, 0.1, 0.1]
             total_loss = (weights[0] * keypoint_loss 
                          + weights[1] * shape_reg 
                          + weights[2] * smoothness_loss 
@@ -830,7 +888,10 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             # you may need to adjust this value based on your specific needs. 
             # A smaller value will allow more freedom in the shape parameters, 
             # while a larger value will constrain them more strongly.
-            weights = [0.5, 0.001, 0.1]
+            if shape_only:
+                weights = [0.5, 0.001, 0.0] # Zero out pose-related weights
+            else:
+                weights = [0.5, 0.001, 0.1]
             total_loss = (weights[0] * keypoint_loss 
                          + weights[1] * shape_reg 
                          + weights[2] * pose_prior)
@@ -842,15 +903,16 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             print("WARNING: NaN loss detected!")
             raise ValueError("NaN loss detected!")
             return torch.tensor(0.0, requires_grad=True, device=DEVICE)
-        
-        total_loss.backward()
-        
-        # 5. Gradient clipping with a smaller norm
-        torch.nn.utils.clip_grad_norm_(params.values(), max_norm=0.1)
 
         return total_loss
     
-    optimize(optimizer_shape, optimizer_pose, closure, max_iter=100)
+    optimize(optimizer_shape=optimizer_shape, 
+             optimizer_pose=optimizer_pose, 
+             closure=closure, 
+             params=params, 
+             batch_start=0, 
+             batch_end=len(keypoints_2d), 
+             max_iter=100)
 
     def create_headless_mesh(smpl_output, body_model):
         vertices = smpl_output.vertices.clone()
@@ -916,24 +978,42 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                 betas=(0.9, 0.999)
             )
             optimizer_pose = torch.optim.Adam(
-                [params['body_pose'], params['global_orient']], 
+                [params['body_pose'], params['global_orient'], params['transl']], 
                 lr=POSE_LR,
                 betas=(0.9, 0.999)
             )
             
-            def closure():
-                optimizer_shape.zero_grad()
-                optimizer_pose.zero_grad()
+            def closure(shape_only=False):
+                # Debug parameter status before computation
+                print("\nParameter status before computation:")
+                print(f"betas requires_grad: {params['betas'].requires_grad}")
+                print(f"body_pose requires_grad: {params['body_pose'].requires_grad}")
+                print(f"global_orient requires_grad: {params['global_orient'].requires_grad}")
+                print(f"transl requires_grad: {params['transl'].requires_grad}")
+
                 # Get SMPL output for batch
-                smpl_output = body_model(
-                    betas=params["betas"].clone().detach(),
-                    global_orient=params["global_orient"][i:batch_end],
-                    body_pose=params["body_pose"][i:batch_end],
-                    transl=params["transl"][i:batch_end],
-                )
+                with torch.set_grad_enabled(True):  # Explicitly enable gradients
+                    smpl_output = body_model(
+                        betas=params["betas"],  # Remove clone().detach() to maintain gradient flow
+                        global_orient=params["global_orient"][i:batch_end],
+                        body_pose=params["body_pose"][i:batch_end],
+                        transl=params["transl"][i:batch_end],
+                        return_verts=True,
+                        return_full_pose=True,
+                    )
                 
-                # Create meshes for both full and headless versions
+                # Debug SMPL output
+                print("\nSMPL output status:")
+                print(f"vertices requires_grad: {smpl_output.vertices.requires_grad}")
+                print(f"joints requires_grad: {smpl_output.joints.requires_grad}")
+                print(f"full_pose requires_grad: {smpl_output.full_pose.requires_grad}")
+                
+                if not smpl_output.vertices.requires_grad:
+                    raise ValueError("SMPL vertices lost gradient tracking!")
+                
+                # Create meshes of headless version
                 vertices_no_head, faces_no_head = create_headless_mesh(smpl_output, body_model)
+                print(f"vertices_no_head requires_grad: {vertices_no_head.requires_grad}")
                 
                 # mesh creation
                 meshes_no_head = Meshes(
@@ -946,6 +1026,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                 
                 # Render silhouettes
                 silhouette_no_head = renderer(meshes_no_head)[..., 3]
+                print(f"silhouette_no_head requires_grad: {silhouette_no_head.requires_grad}")
                 
                 if torch.any(torch.isnan(silhouette_no_head)):
                     print("WARNING: NaN values in no-head silhouette!")
@@ -992,8 +1073,24 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                 silhouette_no_head = torch.clamp(silhouette_no_head, 0, 1)
                 batch_masks_local = torch.clamp(batch_masks_local, 0, 1)
 
+                # Before loss computations, verify inputs require gradients
+                print("\nLoss computation inputs status:")
+                print(f"batch_masks_local requires_grad: {batch_masks_local.requires_grad}")
+                print(f"silhouette_no_head requires_grad: {silhouette_no_head.requires_grad}")
+
                 # Compare both silhouettes with the mask
                 loss_silhouette_no_head = F.mse_loss(batch_masks_local, silhouette_no_head)
+
+                # Loss computations
+                loss_silhouette = loss_silhouette_no_head
+                shape_reg = shape_parameter_regularization(params['betas'][0])
+                shape_loss = shape_specific_loss(silhouette_no_head, batch_masks_local)
+                
+                # Debug loss components
+                print("\nLoss components status:")
+                print(f"loss_silhouette requires_grad: {loss_silhouette.requires_grad}")
+                print(f"shape_reg requires_grad: {shape_reg.requires_grad}")
+                print(f"shape_loss requires_grad: {shape_loss.requires_grad}")
 
                 # Debug visualization with reduced frequency
                 if silhouette_debug and i % 20 == 0:  # Every 20th frame
@@ -1020,11 +1117,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                         cv2.imwrite(debug_path_masked, masked_img)
                         print(f"Saved no-head silhouette for frame {i}")
 
-                loss_silhouette = loss_silhouette_no_head
-
-                # Rest of the loss computation
-                shape_reg = shape_parameter_regularization(params['betas'][0])
-                shape_loss = shape_specific_loss(silhouette_no_head, batch_masks_local)
+                # Rest of loss computation...
                 keypoints_pred = project(projection_matrices, joint_mapper(smpl_output))
                 loss_keypoints = (keypoints_2d[i:batch_end, :, :2] - keypoints_pred).square().sum(-1).sqrt()
                 
@@ -1034,47 +1127,41 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                 anatomical_loss = anatomical_pose_prior(params['body_pose'][i:batch_end])
                 magnitude_prior = angle_magnitude_prior(params['body_pose'])
                 
-                # shape_reg is to penalize unrealistic shape parameters - for more diverse body shapes, this should be decreased.
-                # The weight of shape_reg 0.005 for shape regularization is a starting point - 
-                # you may need to adjust this value based on your specific needs. 
-                # A smaller value will allow more freedom in the shape parameters, 
-                # while a larger value will constrain them more strongly.
-                weights = [50.0, 0.001, 0.01, 0.5, 0.5, 500]  # Added weight for shape_loss
+                # Final loss computation
+                if shape_only:
+                    weights = [50.0, 500, 0.001, 0.0, 0.0, 0.0]
+                else:
+                    weights = [50.0, 500, 0.001, 0.01, 0.5, 0.5]
+                
                 loss = (weights[0] * loss_silhouette 
-                        + weights[1] * shape_reg
-                        + weights[2] * loss_keypoints 
-                        + weights[3] * anatomical_loss 
-                        + weights[4] * magnitude_prior
-                        + weights[5] * shape_loss)  # Add shape-specific loss
-                
-                print(f"Loss: {loss.item():.6f}: \n - Silhouette: {loss_silhouette.item():.6f}, weighted loss_silhouette: {weights[0] * loss_silhouette.item():.6f}, "
-                      f"\n - Shape regularization: {shape_reg.item():.6f}, weighted shape regularization: {weights[1] * shape_reg.item():.6f}, "
-                      f"\n - Keypoints: {loss_keypoints.item():.6f}, weighted loss_keypoints: {weights[2] * loss_keypoints.item():.6f}, "
-                      f"\n - Anatomical: {anatomical_loss.item():.6f}, weighted loss_anatomical: {weights[3] * anatomical_loss.item():.6f}, "
-                      f"\n - Magnitude: {magnitude_prior.item():.6f}, weighted loss_magnitude: {weights[4] * magnitude_prior.item():.6f}, "
-                      f"\n - Shape specific: {shape_loss.item():.6f}, weighted shape_loss: {weights[5] * shape_loss.item():.6f}")
-                
-                loss.backward()
+                        + weights[1] * shape_loss
+                        + weights[2] * shape_reg
+                        + weights[3] * loss_keypoints 
+                        + weights[4] * anatomical_loss 
+                        + weights[5] * magnitude_prior)
 
-                # Scale gradients for different parameter groups
-                param_groups = [
-                    [params['betas']],  # Shape parameters
-                    [params['body_pose'][i:batch_end], params['global_orient'][i:batch_end]]  # Pose parameters
-                ]
-                scale_gradients(param_groups, clip_value=5.0)
+                # Verify final loss requires gradient
+                print("\nFinal loss status:")
+                print(f"Final loss requires_grad: {loss.requires_grad}")
                 
-                # Print gradient norms for debugging
-                if i % 20 == 0:  # Print every 10 iterations
-                    with torch.no_grad():
-                        beta_grad_norm = params['betas'].grad.norm().item()
-                        pose_grad_norm = params['body_pose'].grad[i:batch_end].norm().item()
-                        print(f"\nGradient norms:")
-                        print(f"Beta gradients: {beta_grad_norm:.6f}")
-                        print(f"Pose gradients: {pose_grad_norm:.6f}")
-                
+                if not loss.requires_grad:
+                    raise ValueError("Final loss doesn't require gradients! Check computation graph.")
+
+                print(f"Loss: {loss.item():.6f}: \n - Silhouette: {loss_silhouette.item():.6f}, weighted loss_silhouette: {weights[0] * loss_silhouette.item():.6f}, "
+                      f"\n - Shape specific: {shape_loss.item():.6f}, weighted shape_loss: {weights[1] * shape_loss.item():.6f}, "
+                      f"\n - Shape regularization: {shape_reg.item():.6f}, weighted shape regularization: {weights[2] * shape_reg.item():.6f}, "
+                      f"\n - Keypoints: {loss_keypoints.item():.6f}, weighted loss_keypoints: {weights[3] * loss_keypoints.item():.6f}, "
+                      f"\n - Anatomical: {anatomical_loss.item():.6f}, weighted loss_anatomical: {weights[4] * anatomical_loss.item():.6f}, "
+                      f"\n - Magnitude: {magnitude_prior.item():.6f}, weighted loss_magnitude: {weights[5] * magnitude_prior.item():.6f}")
                 return loss
 
-            optimize(optimizer_shape, optimizer_pose, closure, max_iter=150)
+            optimize(optimizer_shape=optimizer_shape, 
+                     optimizer_pose=optimizer_pose, 
+                     closure=closure, 
+                     params=params, 
+                     batch_start=i, 
+                     batch_end=batch_end, 
+                     max_iter=150)
 
     smpl_params = dict(smpl_params)
     for k in smpl_params:
