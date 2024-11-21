@@ -39,6 +39,8 @@ def scale_gradients(parameters, clip_value=1.0):
         group_grads = []
         for p in param_group:
             if p.grad is not None:
+                # Clip extremely large gradients
+                torch.nn.utils.clip_grad_norm_(p, clip_value)
                 group_grads.append(p.grad.norm())
         if group_grads:
             grad_norms.append(torch.stack(group_grads).mean())
@@ -61,10 +63,15 @@ def scale_gradients(parameters, clip_value=1.0):
 def optimize(optimizer_shape, optimizer_pose, closure, max_iter=100):
     pbar = tqdm(range(max_iter))
     prev_loss = float('inf')
-    best_loss = None
-    patience = 5
+    patience = 3
     patience_counter = 0
-    min_improvement = 1e-8
+    min_improvement = 1e-6
+
+    # Add schedulers
+    scheduler_shape = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_shape, mode='min', factor=0.5, patience=2)
+    scheduler_pose = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_pose, mode='min', factor=0.5, patience=2)
     
     for i in pbar:
         loss = optimizer_shape.step(closure)
@@ -72,21 +79,19 @@ def optimize(optimizer_shape, optimizer_pose, closure, max_iter=100):
 
         current_loss = loss.detach().cpu().numpy()
 
-        # Initialize best_loss on first iteration
-        if best_loss is None:
-            best_loss = current_loss
+        # Update learning rates
+        scheduler_shape.step(current_loss)
+        scheduler_pose.step(current_loss)
         
-        # Early stopping
+        # Early stopping with relative improvement check
         improvement = (prev_loss - current_loss) / (prev_loss + 1e-10)  # Avoid division by zero
         if abs(improvement) < min_improvement:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"Early stopping triggered at iteration {i}, best loss: {best_loss:.6f}")
+                print(f"Early stopping triggered at iteration {i}")
                 break
         else:
             patience_counter = 0
-            if current_loss < best_loss:
-                best_loss = current_loss
             
         prev_loss = current_loss
         pbar.set_postfix_str(f"loss: {current_loss:.6f}")
@@ -592,6 +597,42 @@ def shape_parameter_regularization(betas, original_dim=10):
     
     return (weights[0] * primary_reg + weights[1] * secondary_reg)/sum(weights)
 
+def shape_specific_loss(silhouette_pred, silhouette_target):
+    """Calculate shape-specific metrics with proper normalization"""
+    # Normalize inputs to 0-1 range
+    silhouette_pred = torch.clamp(silhouette_pred, 0, 1)
+    silhouette_target = torch.clamp(silhouette_target, 0, 1)
+    
+    # Get image dimensions for normalization
+    B, H, W = silhouette_pred.shape
+    total_pixels = H * W
+    
+    # 1. Normalized area difference
+    pred_area = silhouette_pred.sum(dim=[1, 2]) / total_pixels
+    target_area = silhouette_target.sum(dim=[1, 2]) / total_pixels
+    area_loss = F.mse_loss(pred_area, target_area)
+
+    # 2. Normalized height/width proportions
+    pred_height = (silhouette_pred.sum(dim=2) > 0).float().sum(dim=1) / H
+    target_height = (silhouette_target.sum(dim=2) > 0).float().sum(dim=1) / H
+    height_loss = F.mse_loss(pred_height, target_height)
+
+    pred_width = (silhouette_pred.sum(dim=1) > 0).float().sum(dim=1) / W
+    target_width = (silhouette_target.sum(dim=1) > 0).float().sum(dim=1) / W
+    width_loss = F.mse_loss(pred_width, target_width)
+
+    # 3. Aspect ratio (already normalized)
+    pred_aspect = pred_height / (pred_width + 1e-8)
+    target_aspect = target_height / (target_width + 1e-8)
+    aspect_loss = F.mse_loss(pred_aspect, target_aspect)
+
+    total_shape_loss = (0.4 * area_loss + 
+                       0.3 * height_loss + 
+                       0.3 * width_loss + 
+                       0.2 * aspect_loss)
+    
+    return total_shape_loss
+
 @torch.no_grad()
 def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1, use_temporal_smoothness=False):
     camera = dict(np.load(f"{root}/cameras.npz"))
@@ -983,6 +1024,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
 
                 # Rest of the loss computation
                 shape_reg = shape_parameter_regularization(params['betas'][0])
+                shape_loss = shape_specific_loss(silhouette_no_head, batch_masks_local)
                 keypoints_pred = project(projection_matrices, joint_mapper(smpl_output))
                 loss_keypoints = (keypoints_2d[i:batch_end, :, :2] - keypoints_pred).square().sum(-1).sqrt()
                 
@@ -997,18 +1039,20 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                 # you may need to adjust this value based on your specific needs. 
                 # A smaller value will allow more freedom in the shape parameters, 
                 # while a larger value will constrain them more strongly.
-                weights = [50.0, 0.001, 0.01, 0.5, 0.5] 
+                weights = [50.0, 0.001, 0.01, 0.5, 0.5, 500]  # Added weight for shape_loss
                 loss = (weights[0] * loss_silhouette 
                         + weights[1] * shape_reg
                         + weights[2] * loss_keypoints 
                         + weights[3] * anatomical_loss 
-                        + weights[4] * magnitude_prior)
+                        + weights[4] * magnitude_prior
+                        + weights[5] * shape_loss)  # Add shape-specific loss
                 
                 print(f"Loss: {loss.item():.6f}: \n - Silhouette: {loss_silhouette.item():.6f}, weighted loss_silhouette: {weights[0] * loss_silhouette.item():.6f}, "
                       f"\n - Shape regularization: {shape_reg.item():.6f}, weighted shape regularization: {weights[1] * shape_reg.item():.6f}, "
                       f"\n - Keypoints: {loss_keypoints.item():.6f}, weighted loss_keypoints: {weights[2] * loss_keypoints.item():.6f}, "
                       f"\n - Anatomical: {anatomical_loss.item():.6f}, weighted loss_anatomical: {weights[3] * anatomical_loss.item():.6f}, "
-                      f"\n - Magnitude: {magnitude_prior.item():.6f}, weighted loss_magnitude: {weights[4] * magnitude_prior.item():.6f}")
+                      f"\n - Magnitude: {magnitude_prior.item():.6f}, weighted loss_magnitude: {weights[4] * magnitude_prior.item():.6f}, "
+                      f"\n - Shape specific: {shape_loss.item():.6f}, weighted shape_loss: {weights[5] * shape_loss.item():.6f}")
                 
                 loss.backward()
 
