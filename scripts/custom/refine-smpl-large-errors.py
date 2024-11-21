@@ -22,10 +22,41 @@ from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_euler_angles
 import trimesh
 
 DEVICE = "cuda"
-SHAPE_LR = 8e-3
-POSE_LR = 1e-3
+SHAPE_LR = 10e-2
+POSE_LR = 5e-3
 
 BATCHSIZE = 12  # Conservative batch size, increase if memory allows
+def scale_gradients(parameters, clip_value=1.0):
+    """
+    Scale gradients to balance different parameter groups
+    Args:
+        parameters: list of parameter groups to scale
+        clip_value: maximum gradient norm
+    """
+    # Get gradient statistics for each parameter group
+    grad_norms = []
+    for param_group in parameters:
+        group_grads = []
+        for p in param_group:
+            if p.grad is not None:
+                group_grads.append(p.grad.norm())
+        if group_grads:
+            grad_norms.append(torch.stack(group_grads).mean())
+    
+    if not grad_norms:  # No gradients to scale
+        return
+    
+    # Calculate mean norm across all groups
+    mean_norm = torch.stack(grad_norms).mean()
+    
+    # Scale each parameter group
+    for param_group, group_norm in zip(parameters, grad_norms):
+        scale = mean_norm / (group_norm + 1e-8)  # Avoid division by zero
+        scale = torch.clamp(scale, 0, clip_value)  # Prevent extreme scaling
+        
+        for p in param_group:
+            if p.grad is not None:
+                p.grad.mul_(scale)
 
 def optimize(optimizer_shape, optimizer_pose, closure, max_iter=100):
     pbar = tqdm(range(max_iter))
@@ -670,8 +701,16 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             params[k] = nn.Parameter(tensor)
 
     # Different learning rates for shape and pose
-    optimizer_shape = torch.optim.Adam([params['betas']], lr=SHAPE_LR)  # Higher learning rate for shape
-    optimizer_pose = torch.optim.Adam([params['body_pose'], params['global_orient']], lr=POSE_LR)
+    optimizer_shape = torch.optim.Adam(
+        [params['betas']], 
+        lr=SHAPE_LR,  # Higher learning rate for shape
+        betas=(0.9, 0.999) 
+    )
+    optimizer_pose = torch.optim.Adam(
+        [params['body_pose'], params['global_orient']], 
+        lr=POSE_LR,
+        betas=(0.9, 0.999)
+    )
     
     def closure():
         optimizer_shape.zero_grad()
@@ -733,7 +772,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             # you may need to adjust this value based on your specific needs. 
             # A smaller value will allow more freedom in the shape parameters, 
             # while a larger value will constrain them more strongly.
-            weights = [0.5, 0.0001, 0.1, 0.1, 0.1]
+            weights = [0.5, 0.001, 0.1, 0.1, 0.1]
             total_loss = (weights[0] * keypoint_loss 
                          + weights[1] * shape_reg 
                          + weights[2] * smoothness_loss 
@@ -750,7 +789,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             # you may need to adjust this value based on your specific needs. 
             # A smaller value will allow more freedom in the shape parameters, 
             # while a larger value will constrain them more strongly.
-            weights = [0.5, 0.0001, 0.1]
+            weights = [0.5, 0.001, 0.1]
             total_loss = (weights[0] * keypoint_loss 
                          + weights[1] * shape_reg 
                          + weights[2] * pose_prior)
@@ -830,8 +869,16 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             batch_end = min(i + BATCHSIZE, len(masks))
             batch_masks = torch.from_numpy(masks[i:batch_end]).float().to(DEVICE) / 255
             
-            optimizer_shape = torch.optim.Adam([params['betas']], lr=SHAPE_LR)
-            optimizer_pose = torch.optim.Adam([params['body_pose'], params['global_orient']], lr=POSE_LR)
+            optimizer_shape = torch.optim.Adam(
+                [params['betas']], 
+                lr=SHAPE_LR,
+                betas=(0.9, 0.999)
+            )
+            optimizer_pose = torch.optim.Adam(
+                [params['body_pose'], params['global_orient']], 
+                lr=POSE_LR,
+                betas=(0.9, 0.999)
+            )
             
             def closure():
                 optimizer_shape.zero_grad()
@@ -950,7 +997,7 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                 # you may need to adjust this value based on your specific needs. 
                 # A smaller value will allow more freedom in the shape parameters, 
                 # while a larger value will constrain them more strongly.
-                weights = [20.0, 0.00001, 0.005, 1.0, 1.0] 
+                weights = [50.0, 0.001, 0.01, 0.5, 0.5] 
                 loss = (weights[0] * loss_silhouette 
                         + weights[1] * shape_reg
                         + weights[2] * loss_keypoints 
@@ -962,10 +1009,28 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                       f"\n - Keypoints: {loss_keypoints.item():.6f}, weighted loss_keypoints: {weights[2] * loss_keypoints.item():.6f}, "
                       f"\n - Anatomical: {anatomical_loss.item():.6f}, weighted loss_anatomical: {weights[3] * anatomical_loss.item():.6f}, "
                       f"\n - Magnitude: {magnitude_prior.item():.6f}, weighted loss_magnitude: {weights[4] * magnitude_prior.item():.6f}")
+                
                 loss.backward()
+
+                # Scale gradients for different parameter groups
+                param_groups = [
+                    [params['betas']],  # Shape parameters
+                    [params['body_pose'][i:batch_end], params['global_orient'][i:batch_end]]  # Pose parameters
+                ]
+                scale_gradients(param_groups, clip_value=5.0)
+                
+                # Print gradient norms for debugging
+                if i % 20 == 0:  # Print every 10 iterations
+                    with torch.no_grad():
+                        beta_grad_norm = params['betas'].grad.norm().item()
+                        pose_grad_norm = params['body_pose'].grad[i:batch_end].norm().item()
+                        print(f"\nGradient norms:")
+                        print(f"Beta gradients: {beta_grad_norm:.6f}")
+                        print(f"Pose gradients: {pose_grad_norm:.6f}")
+                
                 return loss
 
-            optimize(optimizer_shape, optimizer_pose, closure, max_iter=15000)
+            optimize(optimizer_shape, optimizer_pose, closure, max_iter=150)
 
     smpl_params = dict(smpl_params)
     for k in smpl_params:
