@@ -50,13 +50,15 @@ if [ ! -d "$VIDEO_FOLDER/$PREPROCESSED_IMAGE_FOLDER" ] || [ "$FORCE_RERUN" = tru
   python scripts/custom/video-utils.py \
     --video_folder $VIDEO_FOLDER \
     --video_name $VIDEO_NAME \
-    --output_folder $RAW_IMAGE_FOLDER
+    --output_folder $RAW_IMAGE_FOLDER \
+    --fps 100
   echo "converted video $VIDEO_FOLDER/$VIDEO_NAME to images in $VIDEO_FOLDER/$RAW_IMAGE_FOLDER"
 
-  python scripts/custom/preprocess_image.py \
-    --data_dir $VIDEO_FOLDER/$RAW_IMAGE_FOLDER \
-    --image_processed_dir $VIDEO_FOLDER/$PREPROCESSED_IMAGE_FOLDER
-  echo "Preprocessed images in $VIDEO_FOLDER/$PREPROCESSED_IMAGE_FOLDER"
+  # python scripts/custom/preprocess_image.py \
+  #   --data_dir $VIDEO_FOLDER/$RAW_IMAGE_FOLDER \
+  #   --image_processed_dir $VIDEO_FOLDER/$PREPROCESSED_IMAGE_FOLDER
+  # echo "Preprocessed images in $VIDEO_FOLDER/$PREPROCESSED_IMAGE_FOLDER"
+
 else
   echo "Preprocessed images folder exists. Skipping."
 fi
@@ -78,10 +80,10 @@ if [ ! -d "$VIDEO_FOLDER/$MASK_FOLDER" ] || [ "$FORCE_RERUN" = true ]; then
     --image_folder $INPUT_IMAGE_FOLDER
   # python scripts/custom/run-rvm.py --data_dir $VIDEO_FOLDER
 
-  # detect head segmentation with SCHP
-  python scripts/custom/run-schp.py --data_dir $VIDEO_FOLDER --image_folder $INPUT_IMAGE_FOLDER
+  # # remove head from masks with SCHP
+  # python scripts/custom/create-headless-masks.py --data_dir $VIDEO_FOLDER --image_folder $INPUT_IMAGE_FOLDER
 
-  INPUT_MASK_FOLDER="body_only_masks_schp"
+  INPUT_MASK_FOLDER="masks_sam"
   OUTPUT_MASK_FOLDER="masks"
   OUTPUT_MASKED_IMAGES_FOLDER="masked_images"
   python scripts/custom/extract-largest-connected-components.py \
