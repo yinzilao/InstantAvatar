@@ -151,9 +151,10 @@ build/examples/openpose/openpose.bin --video ../../data/custom/a2/a2.MP4 --face 
 docker run --runtime=nvidia \
 	-it --rm \
 	--gpus=all \
-    --shm-size=16g \
+    --shm-size=512g \
     -e NVIDIA_VISIBLE_DEVICES=all \
     -e NVIDIA_DRIVER_CAPABILITIES=all \
+	-e PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:1024 \
 	-e DISPLAY=$DISPLAY \
 	-v /tmp/.X11-unix:/tmp/.X11-unix \
 	-v "$(pwd)":/app \
@@ -196,23 +197,26 @@ python extract_mesh.py --config-name demo \
 python export_smpl_mesh.py --config-name SNARF_NGP_fitting dataset="semes/a2" experiment="baseline" deformer=smpl
 
 
+# add head_segmenation arg input control, by defaul we don't use SAM to create head_segmentation. 
+# python scripts/custom/run-sam.py --data_dir $VIDEO_FOLDER --image_folder $PREPROCESSED_IMAGE_FOLDER
 
 VIDEO_FOLDER=data/custom/e1
-GENDER=female
-PREPROCESSED_IMAGE_FOLDER="preprocessed_images"
-python scripts/custom/run-sam.py --data_dir $VIDEO_FOLDER --image_folder $PREPROCESSED_IMAGE_FOLDER
+VIDEO_NAME="e1"
+GENDER="female"
 
+RAW_IMAGE_FOLDER="raw_images"
+PREPROCESSED_IMAGE_FOLDER="preprocessed_images"
+INPUT_IMAGE_FOLDER=$RAW_IMAGE_FOLDER
+python scripts/custom/run-sam.py --data_dir $VIDEO_FOLDER --image_folder $INPUT_IMAGE_FOLDER
+
+VIDEO_FOLDER=data/custom/e1
+VIDEO_NAME="e1"
+GENDER="female"
+RAW_IMAGE_FOLDER="raw_images"
+PREPROCESSED_IMAGE_FOLDER="preprocessed_images"
+INPUT_IMAGE_FOLDER=$RAW_IMAGE_FOLDER
 python scripts/custom/refine-smpl-large-errors.py     --data_dir $VIDEO_FOLDER     --gender $GENDER     --silhouette
 
 ###==================
-# TEST modelscope SOLIDER - failed
-pip install modelscope[cv] -f https://modelscope.oss-cn-beijing.aliyuncs.com/releases/repo.html
-python scripts/custom/utils/test_solider.py
-
-pip install -r requirements_modelscope.txt --no-deps
-python scripts/custom/utils/test_solider.py
-
-# Test SOLIDER official
-pip install mmcv-full -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0/index.html
-pip install gdown
-python scripts/custom/utils/test_solider.py
+# use SCHP to create head masks
+python scripts/custom/utils/test_SCHP.py
