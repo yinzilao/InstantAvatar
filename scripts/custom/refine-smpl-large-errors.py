@@ -24,6 +24,7 @@ import trimesh
 DEVICE = "cuda"
 SHAPE_LR = 10e-2
 POSE_LR = 5e-3
+NO_HEAD_SILHOUETTE = False
 
 BATCHSIZE = 12  # Conservative batch size, increase if memory allows
 def scale_gradients(parameters, clip_value=1.0):
@@ -312,6 +313,35 @@ def save_mesh_and_measurements(body_model, params, root_dir):
     # np.savez(f"{root_dir}/refine-smpl/measurements.npz", **measurements)
     
     # return measurements
+
+def save_posed_mesh(body_model, params, output_path, pose_type='zero'):
+    """Save SMPL mesh in A-pose or T-pose"""
+    # Keep optimized shape parameters
+    new_params = {
+        'betas': params['betas'],
+        'global_orient': torch.zeros_like(params['global_orient']),  # Reset global rotation
+        'transl': torch.zeros_like(params['transl'])  # Reset translation
+    }
+
+    body_pose = torch.zeros_like(params['body_pose'][0]) # default zero pose
+    if pose_type.lower() == 't':
+        # Set shoulder joints to 90 degrees (π/2 radians) for T-pose
+        body_pose[16*3 + 1] = np.pi/2  # Left shoulder Y-axis
+        body_pose[17*3 + 1] = -np.pi/2  # Right shoulder Y-axis
+    elif pose_type.lower() == 'a':
+        # Set shoulder joints to 45 degrees (π/4 radians) for A-pose
+        body_pose[16*3 + 1] = np.pi/4  # Left shoulder Y-axis
+        body_pose[17*3 + 1] = -np.pi/4  # Right shoulder Y-axis
+
+    new_params['body_pose'] = body_pose.unsqueeze(0)
+        
+    smpl_output = body_model(**new_params)
+    vertices = smpl_output.vertices.detach().cpu().numpy()
+    faces = body_model.faces
+
+    # save mesh
+    mesh = trimesh.Trimesh(vertices[0], faces)
+    mesh.export(output_path)
 
 def temporal_smoothness_loss(vertices, window_size=3, loss_downgrade=1.0):
     """Compute smoothness loss over a sliding window"""
@@ -681,7 +711,7 @@ def shape_specific_loss(silhouette_pred, silhouette_target):
     
     return total_shape_loss
 
-def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1, use_temporal_smoothness=False):
+def main(root, keypoints_threshold, use_silhouette=True, gender="female", downscale=1, use_temporal_smoothness=False):
     camera = dict(np.load(f"{root}/cameras.npz"))
     if downscale > 1:
         camera["intrinsic"][:2] /= downscale
@@ -902,8 +932,6 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
         if torch.isnan(total_loss):
             print("WARNING: NaN loss detected!")
             raise ValueError("NaN loss detected!")
-            return torch.tensor(0.0, requires_grad=True, device=DEVICE)
-
         return total_loss
     
     optimize(optimizer_shape=optimizer_shape, 
@@ -947,7 +975,11 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
     if use_silhouette:
         silhouette_debug = True
         # Load pre-generated body-only masks
-        masks = sorted(glob.glob(f"{root}/body_only_masks_schp/*"))
+        if NO_HEAD_SILHOUETTE:
+            masks = sorted(glob.glob(f"{root}/body_only_masks_schp/*")) # headless masks
+        else:
+            masks = sorted(glob.glob(f"{root}/masks/*")) # full body masks
+
         masks = [cv2.imread(p)[..., 0] for p in masks]
         if downscale > 1:
             masks = [cv2.resize(m, dsize=None, fx=1/downscale, fy=1/downscale) 
@@ -984,13 +1016,6 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
             )
             
             def closure(shape_only=False):
-                # Debug parameter status before computation
-                print("\nParameter status before computation:")
-                print(f"betas requires_grad: {params['betas'].requires_grad}")
-                print(f"body_pose requires_grad: {params['body_pose'].requires_grad}")
-                print(f"global_orient requires_grad: {params['global_orient'].requires_grad}")
-                print(f"transl requires_grad: {params['transl'].requires_grad}")
-
                 # Get SMPL output for batch
                 with torch.set_grad_enabled(True):  # Explicitly enable gradients
                     smpl_output = body_model(
@@ -1001,121 +1026,48 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                         return_verts=True,
                         return_full_pose=True,
                     )
-                
-                # Debug SMPL output
-                print("\nSMPL output status:")
-                print(f"vertices requires_grad: {smpl_output.vertices.requires_grad}")
-                print(f"joints requires_grad: {smpl_output.joints.requires_grad}")
-                print(f"full_pose requires_grad: {smpl_output.full_pose.requires_grad}")
-                
                 if not smpl_output.vertices.requires_grad:
                     raise ValueError("SMPL vertices lost gradient tracking!")
                 
-                # Create meshes of headless version
-                vertices_no_head, faces_no_head = create_headless_mesh(smpl_output, body_model)
-                print(f"vertices_no_head requires_grad: {vertices_no_head.requires_grad}")
-                
-                # mesh creation
-                meshes_no_head = Meshes(
-                    verts=vertices_no_head.float(),
-                    faces=faces_no_head,
-                ).to(DEVICE)
 
-                # Move this line before accessing batch_masks
-                batch_masks_local = batch_masks.clone()  # Create local copy
+                if NO_HEAD_SILHOUETTE:
+                    # headless version
+                    vertices_no_head, faces_no_head = create_headless_mesh(smpl_output, body_model)
+                    vertices = vertices_no_head.float()
+                    faces = faces_no_head
+                else: # full body
+                    vertices = smpl_output.vertices.float()
+                    faces = body_model.faces_tensor
                 
+                # Add batch dimension to faces if it's missing
+                if len(faces.shape) == 2:
+                    faces = faces.unsqueeze(0).expand(vertices.shape[0], -1, -1)
+
+                # Verify shapes before creating meshes
+                print(f"Vertices shape: {vertices.shape}")  # Should be (batch_size, num_vertices, 3)
+                print(f"Faces shape: {faces.shape}")       # Should be (batch_size, num_faces, 3)
+
+                # Create meshes
+                meshes = Meshes(verts=vertices, faces=faces).to(DEVICE)
                 # Render silhouettes
-                silhouette_no_head = renderer(meshes_no_head)[..., 3]
-                print(f"silhouette_no_head requires_grad: {silhouette_no_head.requires_grad}")
-                
-                if torch.any(torch.isnan(silhouette_no_head)):
-                    print("WARNING: NaN values in no-head silhouette!")
-
-                # Validation Debug:No-head silhouette should be 0 at nose keypoint 
-                VALIDATION_NO_HEAD = False
-                if VALIDATION_NO_HEAD:
-                    with torch.no_grad():
-                        # Get nose keypoint (index 0 in BODY25)
-                        nose_keypoints = keypoints_2d[i:batch_end, 0, :2]  # [batch_size, 2]
-                        
-                        # Convert to pixel coordinates
-                        nose_x = nose_keypoints[:, 0].long()
-                        nose_y = nose_keypoints[:, 1].long()
-                        
-                        # Ensure coordinates are within image bounds
-                        nose_x = torch.clamp(nose_x, 0, silhouette_no_head.shape[2]-1)
-                        nose_y = torch.clamp(nose_y, 0, silhouette_no_head.shape[1]-1)
-                        
-                        # Sample silhouette values at nose positions
-                        nose_values_no_head = []
-                        
-                        for b in range(batch_end - i):
-                            no_head_val = silhouette_no_head[b, nose_y[b], nose_x[b]].item()
-                            nose_values_no_head.append(no_head_val)
-                            
-                        print(f"\nHead area verification (at nose keypoint):")
-                        print(f"No-head silhouette values: {nose_values_no_head}")
-                        
-                        # Also check a 5x5 patch around nose
-                        patch_size = 5
-                        for b in range(batch_end - i):
-                            x, y = nose_x[b], nose_y[b]
-                            x1, x2 = max(0, x-patch_size//2), min(silhouette_no_head.shape[2], x+patch_size//2+1)
-                            y1, y2 = max(0, y-patch_size//2), min(silhouette_no_head.shape[1], y+patch_size//2+1)
-                            
-                            patch_no_head = silhouette_no_head[b, y1:y2, x1:x2]
-                            
-                            print(f"\nBatch {b} - 5x5 patch around nose:")
-                            print("No-head silhouette patch:")
-                            print(patch_no_head.cpu().numpy())
+                silhouette = renderer(meshes)[..., 3]
 
                 # Ensure proper normalization
-                silhouette_no_head = torch.clamp(silhouette_no_head, 0, 1)
+                silhouette = torch.clamp(silhouette, 0, 1)
+                # Create and normalize local copy of batch_masks
+                batch_masks_local = batch_masks.clone()
                 batch_masks_local = torch.clamp(batch_masks_local, 0, 1)
 
-                # Before loss computations, verify inputs require gradients
-                print("\nLoss computation inputs status:")
-                print(f"batch_masks_local requires_grad: {batch_masks_local.requires_grad}")
-                print(f"silhouette_no_head requires_grad: {silhouette_no_head.requires_grad}")
-
                 # Compare both silhouettes with the mask
-                loss_silhouette_no_head = F.mse_loss(batch_masks_local, silhouette_no_head)
+                loss_silhouette = F.mse_loss(batch_masks_local, silhouette)
 
                 # Loss computations
-                loss_silhouette = loss_silhouette_no_head
                 shape_reg = shape_parameter_regularization(params['betas'][0])
-                shape_loss = shape_specific_loss(silhouette_no_head, batch_masks_local)
+                shape_loss = shape_specific_loss(silhouette, batch_masks_local)
                 
-                # Debug loss components
-                print("\nLoss components status:")
-                print(f"loss_silhouette requires_grad: {loss_silhouette.requires_grad}")
-                print(f"shape_reg requires_grad: {shape_reg.requires_grad}")
-                print(f"shape_loss requires_grad: {shape_loss.requires_grad}")
-
                 # Debug visualization with reduced frequency
                 if silhouette_debug and i % 20 == 0:  # Every 20th frame
-                    with torch.no_grad():
-                        batch_idx = 0  # Use first frame in current batch
-                        # Convert no-head silhouette to numpy and scale to 0-255 range
-                        sil_no_head = silhouette_no_head[batch_idx].detach().cpu().numpy()
-                        sil_no_head = (sil_no_head * 255).astype(np.uint8)
-                        
-                        # Get the corresponding mask
-                        mask = batch_masks_local[batch_idx].detach().cpu().numpy()
-                        mask = (mask * 255).astype(np.uint8)
-                        
-                        # Create masked image (red = silhouette, green = mask)
-                        masked_img = np.zeros((sil_no_head.shape[0], sil_no_head.shape[1], 3), dtype=np.uint8)
-                        masked_img[..., 2] = sil_no_head  # Red channel for silhouette
-                        masked_img[..., 1] = mask         # Green channel for mask
-                        
-                        # Save the silhouette
-                        debug_path_sil = os.path.join(debug_dir, f'silhouette_no_head_{i:04d}.png')
-                        debug_path_masked = os.path.join(debug_dir, f'masked_{i:04d}.png')
-
-                        cv2.imwrite(debug_path_sil, sil_no_head)
-                        cv2.imwrite(debug_path_masked, masked_img)
-                        print(f"Saved no-head silhouette for frame {i}")
+                    save_sil_debug_image(silhouette, batch_masks_local)
 
                 # Rest of loss computation...
                 keypoints_pred = project(projection_matrices, joint_mapper(smpl_output))
@@ -1154,6 +1106,30 @@ def main(root, keypoints_threshold, use_silhouette, gender="female", downscale=1
                       f"\n - Anatomical: {anatomical_loss.item():.6f}, weighted loss_anatomical: {weights[4] * anatomical_loss.item():.6f}, "
                       f"\n - Magnitude: {magnitude_prior.item():.6f}, weighted loss_magnitude: {weights[5] * magnitude_prior.item():.6f}")
                 return loss
+            
+            @torch.no_grad()
+            def save_sil_debug_image(silhouette, batch_masks_local):
+                batch_idx = 0  # Use first frame in current batch
+                # Convert silhouette to numpy and scale to 0-255 range
+                sil = silhouette[batch_idx].detach().cpu().numpy()
+                sil = (sil * 255).astype(np.uint8)
+                        
+                # Get the corresponding mask
+                mask = batch_masks_local[batch_idx].detach().cpu().numpy()
+                mask = (mask * 255).astype(np.uint8)
+                
+                # Create masked image (red = silhouette, green = mask)
+                masked_img = np.zeros((sil.shape[0], sil.shape[1], 3), dtype=np.uint8)
+                masked_img[..., 2] = sil  # Red channel for silhouette
+                masked_img[..., 1] = mask         # Green channel for mask
+                
+                # Save the silhouette
+                debug_path_sil = os.path.join(debug_dir, f'silhouette_{i:04d}.png')
+                debug_path_masked = os.path.join(debug_dir, f'masked_{i:04d}.png')
+
+                cv2.imwrite(debug_path_sil, sil)
+                cv2.imwrite(debug_path_masked, masked_img)
+                print(f"Saved silhouette for frame {i}")
 
             optimize(optimizer_shape=optimizer_shape, 
                      optimizer_pose=optimizer_pose, 
