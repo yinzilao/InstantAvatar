@@ -973,7 +973,7 @@ def main(root, keypoints_threshold, use_silhouette=True, gender="female", downsc
         return vertices_no_head, faces_no_head
 
     if use_silhouette:
-        silhouette_debug = True
+        SIL_DEBUG = True
         # Load pre-generated body-only masks
         if NO_HEAD_SILHOUETTE:
             masks = sorted(glob.glob(f"{root}/body_only_masks_schp/*")) # headless masks
@@ -994,7 +994,7 @@ def main(root, keypoints_threshold, use_silhouette=True, gender="female", downsc
         img_size = masks[0].shape[:2]
         renderer = build_renderer(camera, img_size)
 
-        if silhouette_debug:
+        if SIL_DEBUG:
             # Create debug directory
             debug_dir = os.path.join(root, "refine-smpl", "debug")
             os.makedirs(debug_dir, exist_ok=True)
@@ -1066,7 +1066,7 @@ def main(root, keypoints_threshold, use_silhouette=True, gender="female", downsc
                 shape_loss = shape_specific_loss(silhouette, batch_masks_local)
                 
                 # Debug visualization with reduced frequency
-                if silhouette_debug and i % 20 == 0:  # Every 20th frame
+                if SIL_DEBUG and i % 20 == 0:  # Every 20th frame
                     save_sil_debug_image(silhouette, batch_masks_local)
 
                 # Rest of loss computation...
@@ -1081,9 +1081,9 @@ def main(root, keypoints_threshold, use_silhouette=True, gender="female", downsc
                 
                 # Final loss computation
                 if shape_only:
-                    weights = [50.0, 500, 0.001, 0.0, 0.0, 0.0]
+                    weights = [50.0, 0, 0.001, 0.0, 0.0, 0.0] # [50.0, 500, 0.001, 0.0, 0.0, 0.0] # TODO: removed shape_loss temporarily. fix later.
                 else:
-                    weights = [50.0, 500, 0.001, 0.01, 0.5, 0.5]
+                    weights = [50.0, 0, 0.001, 0.01, 0.5, 0.5] # [50.0, 500, 0.001, 0.01, 0.5, 0.5] # TODO: removed shape_loss temporarily. fix later.
                 
                 loss = (weights[0] * loss_silhouette 
                         + weights[1] * shape_loss
