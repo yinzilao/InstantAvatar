@@ -22,7 +22,7 @@ from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_euler_angles
 import trimesh
 from typing import List
 
-from utils.schp_utils import ModelType, get_hair_hat_mask, get_face_mask, get_schp_segmentation, get_schp_segmentation_batch
+from utils.schp_utils import ModelType, get_hair_hat_mask, get_face_mask, get_schp_segmentation, get_schp_segmentation_batch, SCHPModel
 
 DEVICE = "cuda"
 SHAPE_LR = 10e-2
@@ -278,19 +278,30 @@ def draw_detect(frame: np.ndarray, poses2d: np.ndarray, color=(255, 255, 0)):
             frame = cv2.circle(frame, tuple(pos), 2, (color), 2, cv2.FILLED)
     return frame
 
+@torch.no_grad()
 def get_hair_hat_face_weight_mask(
-        seg_map: np.ndarray, 
+        seg_map: torch.Tensor,  # Now expecting a GPU tensor
         model_type=ModelType.ATR, 
-        weights: List[float] = [0.0, 0.5, 1.0]
+        weights: torch.Tensor = None  # Now expecting GPU tensor
     ):
-    """Get weight mask for hair and hat regions"""
+    """Get weight mask for hair and hat regions (GPU version)"""
+    if not torch.is_tensor(seg_map): 
+        print("seg_map is not torch.Tensor as expected.")
+        raise ValueError("seg_map is not torch.Tensor as expected.")
+        torch.from_numpy(seg_map).to(DEVICE)
+
+    if weights is None:
+        weights = torch.tensor([0.0, 0.5, 1.0], device=seg_map.device)
+        
     hair_hat_mask = get_hair_hat_mask(seg_map, model_type)
     face_mask = get_face_mask(seg_map, model_type)
-    # create weight mask (0.0 for hair and hat, 1.0 for other regions, 0.5 for face)
-    hair_hat_face_weight_mask = np.ones_like(hair_hat_mask) * weights[2]
-    hair_hat_face_weight_mask[hair_hat_mask > 0] = weights[0]
-    hair_hat_face_weight_mask[face_mask > 0] = weights[1]
-    return hair_hat_face_weight_mask
+    
+    # Create weight mask on GPU
+    weight_mask = torch.ones_like(hair_hat_mask) * weights[2]
+    weight_mask[hair_hat_mask > 0] = weights[0]
+    weight_mask[face_mask > 0] = weights[1]
+    
+    return weight_mask
 
 def save_mesh_and_measurements(body_model, params, root_dir):
     """Generate and save SMPL mesh and body measurements.
@@ -698,10 +709,12 @@ def shape_specific_loss(silhouette_pred, silhouette_target, weight_masks=None):
     # Normalize inputs to 0-1 range
     silhouette_pred = torch.clamp(silhouette_pred, 0, 1)
     silhouette_target = torch.clamp(silhouette_target, 0, 1)
+    weight_masks = torch.clamp(weight_masks, 0, 1)
     
     # Get image dimensions for normalization
     B, H, W = silhouette_pred.shape
     total_pixels = H * W
+    print(f"silhouette_pred.shape: {silhouette_pred.shape}, total_pixels: {total_pixels}")
     
     if weight_masks is not None:
         # Convert weight_masks to tensor if it's numpy array
@@ -738,13 +751,14 @@ def shape_specific_loss(silhouette_pred, silhouette_target, weight_masks=None):
     target_aspect = target_height / (target_width + 1e-8)
     aspect_loss = F.mse_loss(pred_aspect, target_aspect)
 
-    total_shape_loss = (0.4 * area_loss + 
-                       0.3 * height_loss + 
-                       0.3 * width_loss + 
-                       0.2 * aspect_loss)
+    total_shape_loss = (0.5 * area_loss + 
+                       0.2 * height_loss + 
+                       0.2 * width_loss + 
+                       0.1 * aspect_loss)
     
     return total_shape_loss
 
+@torch.no_grad()
 def generate_and_save_hair_hat_face_weight_masks(
         input_image_dir: str, 
         input_image_names: List[str],
@@ -753,14 +767,17 @@ def generate_and_save_hair_hat_face_weight_masks(
         downscale: int = 1,
         batch_size: int = BATCHSIZE 
     ) -> List[np.ndarray]:
-    """Generate weight masks for hair, hat, and face regions with batch processing"""
+    """Generate weight masks for hair, hat, and face regions with GPU batch processing"""
     
     img_paths = [os.path.join(input_image_dir, name) for name in input_image_names]
     if not all(os.path.exists(img_path) for img_path in img_paths):
         raise FileNotFoundError(f"One or more images do not exist in {input_image_dir}")
     
+    # Initialize SCHP model once
+    model = SCHPModel(model_type)
+    
     total_frames = len(img_paths)
-    weights = [0.0, 0.5, 1.0]
+    weights = torch.tensor([0.0, 0.5, 1.0], device="cuda")  # Move weights to GPU
     weight_masks = []
     
     print(f"\nProcessing {total_frames} frames in batches of {batch_size}")
@@ -771,38 +788,36 @@ def generate_and_save_hair_hat_face_weight_masks(
         batch_paths = img_paths[i:batch_end]
         
         print(f"\nProcessing batch {i//batch_size + 1}/{(total_frames + batch_size - 1)//batch_size}")
-        print(f"1. Running SCHP segmentation for frames {i} to {batch_end-1}")
         
-        # Get segmentation maps for batch
-        seg_maps = get_schp_segmentation_batch(model_type, batch_paths, batch_size)
+        # Get segmentation maps for batch (already on GPU)
+        seg_maps = model.process_batch(batch_paths, batch_size)
         
-        print(f"2. Generating weight masks for frames {i} to {batch_end-1}")
+        # Process each segmentation map
         for img_path, seg_map in tqdm(zip(batch_paths, seg_maps), 
                                     total=len(batch_paths),
                                     desc="Generating weight masks"):
-            weight_mask = get_hair_hat_face_weight_mask(seg_map=seg_map, 
-                                                      model_type=model_type, 
-                                                      weights=weights)
+            # Generate weight mask (keeping on GPU until save)
+            weight_mask = get_hair_hat_face_weight_mask(
+                seg_map=seg_map, 
+                model_type=model_type,
+                weights=weights
+            )
             
-            # Validate unique values
-            print(f"Unique values in weight mask: {np.unique(weight_mask).tolist()}")
-            assert np.unique(weight_mask).tolist() == weights, "Weight mask contains invalid values"
-
-            # Save as data (value 0, 0.5, 1)
+            # Move to CPU only when saving
+            weight_mask_cpu = weight_mask.cpu().numpy()
+            
             basename = os.path.basename(img_path)
             weight_mask_data_name = os.path.splitext(basename)[0] + '.npy'
-            np.save(os.path.join(output_weight_masks_dir, weight_mask_data_name), weight_mask)
+            np.save(os.path.join(output_weight_masks_dir, weight_mask_data_name), 
+                   weight_mask_cpu)
             
-            # Save visualization
-            weight_mask_uint8 = np.round(weight_mask * 255).astype(np.uint8)
-            weight_mask_png_name = os.path.splitext(basename)[0] + '.png'
-            cv2.imwrite(os.path.join(output_weight_masks_dir, weight_mask_png_name), 
-                        weight_mask_uint8)
-
             if downscale > 1:
-                weight_mask = cv2.resize(weight_mask, dsize=None, fx=1/downscale, fy=1/downscale)
+                weight_mask_cpu = cv2.resize(weight_mask_cpu, 
+                                          dsize=None, 
+                                          fx=1/downscale, 
+                                          fy=1/downscale)
             
-            weight_masks.append(weight_mask)
+            weight_masks.append(weight_mask_cpu)
     
     return weight_masks
 
@@ -1094,29 +1109,36 @@ def main(root, keypoints_threshold, use_silhouette=True, gender="female", downsc
             hhf_weight_mask_names = [n + '.npy' for n in masked_image_base_names]
 
             existing_weight_mask_paths = sorted(glob.glob(f"{hhf_weight_masks_dir}/*.npy"))
+            existing_weight_mask_names = [os.path.basename(p) for p in existing_weight_mask_paths]
+            print(f"Found {len(existing_weight_mask_paths)} out of {len(masked_image_paths)} existing masks")
 
-            new_weight_mask_indices = [i for i, n in enumerate(hhf_weight_mask_names) if n not in existing_weight_mask_paths]
-
-            input_image_names = [masked_image_names[i] for i in new_weight_mask_indices]
-
+            new_weight_mask_indices = [i for i, n in enumerate(hhf_weight_mask_names) if n not in existing_weight_mask_names]
+            print(f"existing_weight_mask_paths[:5]: {existing_weight_mask_names[:5]}")
+            print(f"hhf_weight_mask_names[:5]: {hhf_weight_mask_names[:5]}")
+            
+            
+            weight_masks = [None] * len(masked_image_names)
             # load existing weight masks
             for i, p in enumerate(existing_weight_mask_paths):
                 if os.path.exists(p):
-                    print(f"Loading existing hair, hat, and face weight mask from {p}")
                     weight_masks[i] = np.load(p)
                     if downscale > 1:
                         weight_masks[i] = cv2.resize(weight_masks[i], dsize=None, fx=1/downscale, fy=1/downscale)
 
-            # generate new weight masks
-            print(f"\nGenerating hair, hat, and face weight masks and saving to {hhf_weight_masks_dir}")
-            model_type = ModelType.ATR
-            new_weight_masks = generate_and_save_hair_hat_face_weight_masks(input_image_dir=f"{root}/masked_images",
-                                                                        input_image_names=input_image_names,
-                                                                        output_weight_masks_dir=hhf_weight_masks_dir, 
-                                                                        model_type=model_type, 
-                                                                        downscale=downscale,
-                                                                        batch_size=BATCHSIZE)
-            weight_masks[new_weight_mask_indices] = new_weight_masks
+            if len(new_weight_mask_indices) > 0:
+                print(f"Generating {len(new_weight_mask_indices)} new masks...")
+                input_image_names = [masked_image_names[i] for i in new_weight_mask_indices]
+
+                # generate new weight masks
+                print(f"\nGenerating hair, hat, and face weight masks and saving to {hhf_weight_masks_dir}")
+                model_type = ModelType.ATR
+                new_weight_masks = generate_and_save_hair_hat_face_weight_masks(input_image_dir=f"{root}/masked_images",
+                                                                            input_image_names=input_image_names,
+                                                                            output_weight_masks_dir=hhf_weight_masks_dir, 
+                                                                            model_type=model_type, 
+                                                                            downscale=downscale,
+                                                                            batch_size=BATCHSIZE)
+                weight_masks[new_weight_mask_indices] = new_weight_masks
 
             weight_masks = np.stack(weight_masks, axis=0)
 
@@ -1151,6 +1173,13 @@ def main(root, keypoints_threshold, use_silhouette=True, gender="female", downsc
             )
             
             def closure(shape_only=False):
+                # Add progress tracking at the start of closure
+                current_batch_start = i
+                current_batch_end = batch_end
+                total_frames = len(masks)
+                current_batch = (current_batch_start // BATCHSIZE) + 1
+                total_batches = (total_frames + BATCHSIZE - 1) // BATCHSIZE  # Ceiling division
+
                 # Get SMPL output for batch
                 with torch.set_grad_enabled(True):  # Explicitly enable gradients
                     smpl_output = body_model(
@@ -1213,7 +1242,7 @@ def main(root, keypoints_threshold, use_silhouette=True, gender="female", downsc
 
                 # Loss computations
                 shape_reg = shape_parameter_regularization(params['betas'][0])
-                shape_loss = shape_specific_loss(silhouette, batch_masks_local, weight_masks)
+                shape_loss = shape_specific_loss(silhouette, batch_masks_local, batch_weight_masks)
                 
                 # Debug visualization with reduced frequency
                 if SIL_DEBUG and i % 20 == 0:  # Every 20th frame
@@ -1231,9 +1260,9 @@ def main(root, keypoints_threshold, use_silhouette=True, gender="female", downsc
                 
                 # Final loss computation
                 if shape_only:
-                    weights = [50.0, 0, 0.001, 0.0, 0.0, 0.0] # [50.0, 500, 0.001, 0.0, 0.0, 0.0] # TODO: removed shape_loss temporarily. fix later.
+                    weights = [50.0, 500, 0.001, 0.0, 0.0, 0.0] # [50.0, 500, 0.001, 0.0, 0.0, 0.0] # TODO: removed shape_loss temporarily. fix later.
                 else:
-                    weights = [50.0, 0, 0.001, 0.01, 0.5, 0.5] # [50.0, 500, 0.001, 0.01, 0.5, 0.5] # TODO: removed shape_loss temporarily. fix later.
+                    weights = [50.0, 500, 0.001, 0.01, 0.5, 0.5] # [50.0, 500, 0.001, 0.01, 0.5, 0.5] # TODO: removed shape_loss temporarily. fix later.
                 
                 loss = (weights[0] * loss_silhouette 
                         + weights[1] * shape_loss
@@ -1248,13 +1277,23 @@ def main(root, keypoints_threshold, use_silhouette=True, gender="female", downsc
                 
                 if not loss.requires_grad:
                     raise ValueError("Final loss doesn't require gradients! Check computation graph.")
-
-                print(f"Loss: {loss.item():.6f}: \n - Silhouette: {loss_silhouette.item():.6f}, weighted loss_silhouette: {weights[0] * loss_silhouette.item():.6f}, "
-                      f"\n - Shape specific: {shape_loss.item():.6f}, weighted shape_loss: {weights[1] * shape_loss.item():.6f}, "
-                      f"\n - Shape regularization: {shape_reg.item():.6f}, weighted shape regularization: {weights[2] * shape_reg.item():.6f}, "
-                      f"\n - Keypoints: {loss_keypoints.item():.6f}, weighted loss_keypoints: {weights[3] * loss_keypoints.item():.6f}, "
-                      f"\n - Anatomical: {anatomical_loss.item():.6f}, weighted loss_anatomical: {weights[4] * anatomical_loss.item():.6f}, "
-                      f"\n - Magnitude: {magnitude_prior.item():.6f}, weighted loss_magnitude: {weights[5] * magnitude_prior.item():.6f}")
+                
+                # Enhanced progress printing
+                print(f"\nProcessing frames {current_batch_start:04d}-{current_batch_end-1:04d} "
+                    f"(Batch {current_batch}/{total_batches}, "
+                    f"Total progress: {current_batch_end/total_frames*100:.1f}%)")
+                print(f"Loss Breakdown (Shape_only={shape_only}):")
+                print(f"{'='*80}")
+                print(f"Total Loss: {loss.item():.6f}")
+                print(f"│")
+                print(f"├── Silhouette Loss:        {loss_silhouette.item():.6f} × {weights[0]:>7.1f} = {weights[0] * loss_silhouette.item():.6f}")
+                print(f"├── Shape Specific Loss:     {shape_loss.item():.6f} × {weights[1]:>7.1f} = {weights[1] * shape_loss.item():.6f}")
+                print(f"├── Shape Regularization:    {shape_reg.item():.6f} × {weights[2]:>7.1f} = {weights[2] * shape_reg.item():.6f}")
+                print(f"├── Keypoints Loss:          {loss_keypoints.item():.6f} × {weights[3]:>7.1f} = {weights[3] * loss_keypoints.item():.6f}")
+                print(f"├── Anatomical Loss:         {anatomical_loss.item():.6f} × {weights[4]:>7.1f} = {weights[4] * anatomical_loss.item():.6f}")
+                print(f"└── Magnitude Prior:         {magnitude_prior.item():.6f} × {weights[5]:>7.1f} = {weights[5] * magnitude_prior.item():.6f}")
+                print(f"{'='*80}")
+                
                 return loss
             
             @torch.no_grad()
