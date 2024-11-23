@@ -88,10 +88,27 @@ def get_head_mask(seg_map: np.ndarray, model_type: ModelType):
     head_label_names = HEAD_LABELS_BY_MODEL[model_type]
     return get_mask_for_labels(seg_map, model_type, head_label_names)
 
-def get_hair_hat_mask(seg_map: np.ndarray, model_type: ModelType):
+def get_hair_hat_mask(seg_map: np.ndarray, model_type: ModelType = ModelType.ATR):
     """Get binary mask for hair and hat regions"""
-    hair_hat_labels = {'Hair', 'Hat'} if model_type != ModelType.PASCAL else {'Head'}
+    if model_type != ModelType.PASCAL:
+        hair_hat_labels = {'Hair', 'Hat'}
+    else:
+        raise ValueError("PASCAL model does not have hair or hat labels, "
+                         "please use get_head_mask instead, "
+                         "or you can use model ATR (recommended) or PIL to get hair and hat masks")
+    
     return get_mask_for_labels(seg_map, model_type, hair_hat_labels)
+
+def get_face_mask(seg_map: np.ndarray, model_type: ModelType = ModelType.ATR):
+    """Get binary mask for face region"""
+    if model_type != ModelType.PASCAL:
+        face_label = {'Face'}
+    else:
+        raise ValueError("PASCAL model does not have face labels, "
+                         "please use get_head_mask instead, "
+                         "or you can use model ATR (recommended) to get face mask")
+    
+    return get_mask_for_labels(seg_map, model_type, face_label)
 
 def save_debug_visualization(seg_map: np.ndarray, orig_img: np.ndarray, 
                            model_type: ModelType, output_path: str):
@@ -151,6 +168,51 @@ def save_debug_visualization(seg_map: np.ndarray, orig_img: np.ndarray,
                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     
     cv2.imwrite(output_path, debug_img)
+
+def get_schp_segmentation_batch(model_type: ModelType, image_paths: list, batch_size: int = 12):
+    """Process images in batches"""
+    model_path = SCHP_PATH / "pretrained_models" / MODEL_PATHS[model_type]
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found at {model_path}")
+    
+    seg_maps = []
+    
+    # Process in batches
+    for i in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[i:i + batch_size]
+        
+        # Create temporary directory for this batch
+        temp_input_dir = "temp_input_batch"
+        os.makedirs(temp_input_dir, exist_ok=True)
+        
+        # Copy batch images to temp directory
+        for img_path in batch_paths:
+            os.symlink(img_path, os.path.join(temp_input_dir, os.path.basename(img_path)))
+        
+        # Run SCHP for this batch
+        cmd = [
+            "python", 
+            str(SCHP_PATH / "simple_extractor.py"),
+            "--dataset", model_type.value,
+            "--model-restore", str(model_path),
+            "--input-dir", temp_input_dir,
+            "--output-dir", "temp_output",
+            "--logits"
+        ]
+        
+        subprocess.run(cmd, check=True)
+        
+        # Collect results for this batch
+        for img_path in batch_paths:
+            seg_map = np.array(Image.open(f"temp_output/{os.path.basename(img_path)}"))
+            seg_maps.append(seg_map)
+        
+        # Cleanup
+        for f in os.listdir(temp_input_dir):
+            os.unlink(os.path.join(temp_input_dir, f))
+        os.rmdir(temp_input_dir)
+    
+    return seg_maps
 
 def main():
     model_type = ModelType.PASCAL
