@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 
-from utils.schp_wrapper import ModelType, setup_schp, create_head_masks
+from scripts.custom.utils.schp_utils import ModelType, setup_schp, create_head_masks
 
 def create_body_only_masks(sam_masks_dir, head_masks_dir, body_only_masks_dir):
     """Subtract head masks from SAM masks to create body-only masks"""
