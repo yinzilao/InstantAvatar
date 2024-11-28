@@ -777,7 +777,7 @@ def generate_and_save_hair_hat_face_weight_masks(
     model = SCHPModel(model_type)
     
     total_frames = len(img_paths)
-    weights = torch.tensor([0.0, 0.5, 1.0], device="cuda")  # Move weights to GPU
+    weights = torch.tensor([0.001, 0.5, 1.0], device="cuda")  # Move weights to GPU
     weight_masks = []
     
     print(f"\nProcessing {total_frames} frames in batches of {batch_size}")
