@@ -201,7 +201,7 @@ python export_smpl_mesh.py --config-name SNARF_NGP_fitting dataset="semes/a2" ex
 # python scripts/custom/run-sam.py --data_dir $VIDEO_FOLDER --image_folder $PREPROCESSED_IMAGE_FOLDER
 
 VIDEO_FOLDER=data/custom/e1
-VIDEO_NAME="e1"
+VIDEO_NAME="e1.MP4"
 GENDER="female"
 
 RAW_IMAGE_FOLDER="raw_images"
@@ -210,7 +210,7 @@ INPUT_IMAGE_FOLDER=$RAW_IMAGE_FOLDER
 python scripts/custom/run-sam.py --data_dir $VIDEO_FOLDER --image_folder $INPUT_IMAGE_FOLDER
 
 VIDEO_FOLDER=data/custom/e1
-VIDEO_NAME="e1"
+VIDEO_NAME="e1.MP4"
 GENDER="female"
 RAW_IMAGE_FOLDER="raw_images"
 PREPROCESSED_IMAGE_FOLDER="preprocessed_images"

@@ -51,7 +51,7 @@ if [ ! -d "$VIDEO_FOLDER/$PREPROCESSED_IMAGE_FOLDER" ] || [ "$FORCE_RERUN" = tru
     --video_folder $VIDEO_FOLDER \
     --video_name $VIDEO_NAME \
     --output_folder $RAW_IMAGE_FOLDER \
-    --fps 100
+    --fps 10
   echo "converted video $VIDEO_FOLDER/$VIDEO_NAME to images in $VIDEO_FOLDER/$RAW_IMAGE_FOLDER"
 
   # python scripts/custom/preprocess_image.py \

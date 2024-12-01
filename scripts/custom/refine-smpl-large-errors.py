@@ -29,6 +29,7 @@ SHAPE_LR = 10e-2
 POSE_LR = 5e-3
 NO_HEAD_SILHOUETTE = False
 USE_HAIR_HAT_FACE_WEIGHT = True
+WEIGHT_MASKS_VIS = True
 
 BATCHSIZE = 12  # Conservative batch size, increase if memory allows
 def scale_gradients(parameters, clip_value=1.0):
@@ -1138,7 +1139,8 @@ def main(root, keypoints_threshold, use_silhouette=True, gender="female", downsc
                                                                             model_type=model_type, 
                                                                             downscale=downscale,
                                                                             batch_size=BATCHSIZE)
-                weight_masks[new_weight_mask_indices] = new_weight_masks
+                for idx, new_mask in zip(new_weight_mask_indices, new_weight_masks):
+                    weight_masks[idx] = new_mask
 
             weight_masks = np.stack(weight_masks, axis=0)
 
